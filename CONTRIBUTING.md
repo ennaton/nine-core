@@ -13,7 +13,7 @@ type(scope): message
 
 ## Pull requests
 
-- Keep the diff minimal — change the lines the task requires and no others.
+- Keep the diff minimal: change the lines the task requires and no others.
 - CI must be green: lint, type-check, tests, and image scan where applicable.
 - A change that affects performance carries a measurement, not an assertion.
 
