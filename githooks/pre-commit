@@ -63,11 +63,14 @@ diff_text=$(printf '%s\n' "$diff_text" | grep -v 'nine:allow-secret' || true)
 
 for entry in "${scan_patterns[@]}"; do
   name="${entry%%|*}"; pat="${entry#*|}"
-  if printf '%s\n' "$diff_text" | grep -nEq "$pat"; then
-    n=$(printf '%s\n' "$diff_text" | grep -cE "$pat")
+  # -- before the pattern: several of these start with a dash and grep would
+  # otherwise read them as options. The private key rule failed silently this
+  # way, which meant a key could be committed on a machine without gitleaks.
+  if printf '%s\n' "$diff_text" | grep -nEq -- "$pat"; then
+    n=$(printf '%s\n' "$diff_text" | grep -cE -- "$pat")
     red "BLOCKED  $name"
     echo "         $n matching line(s) in the staged diff. The value is not printed here on purpose."
-    echo "         Find it with: git diff --cached | grep -nE '$pat'"
+    echo "         Find it with: git diff --cached | grep -nE -- '$pat'"
     fail=1
   fi
 done
