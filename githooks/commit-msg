@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Commit message shape: type(scope): message, one line, no trailer.
+set -uo pipefail
+msg_file="$1"
+# Ignore comment lines and merge commits.
+subject=$(grep -v '^#' "$msg_file" | head -1)
+body=$(grep -v '^#' "$msg_file" | tail -n +2 | grep -v '^[[:space:]]*$' || true)
+
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+
+case "$subject" in
+  "Merge "*|"Revert "*) exit 0 ;;
+esac
+
+if ! printf '%s' "$subject" | grep -qE '^(feat|fix|refactor|chore|docs|style|perf|test|ci|build)(\([a-z0-9,._-]+\))?: .{6,}$'; then
+  red "commit refused: subject must be  type(scope): message"
+  echo "  type: feat fix refactor chore docs style perf test ci build"
+  echo "  got:  $subject"
+  exit 1
+fi
+
+if [ ${#subject} -gt 100 ]; then
+  red "commit refused: subject is ${#subject} characters, keep it under 100"
+  exit 1
+fi
+
+if printf '%s' "$subject" | grep -q '—'; then
+  red "commit refused: em dash in the subject"
+  exit 1
+fi
+
+if printf '%s\n' "$body" | grep -qiE 'co-authored-by|generated with|🤖'; then
+  red "commit refused: no co-author or generator trailers in Nine history"
+  exit 1
+fi

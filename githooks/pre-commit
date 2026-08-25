@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Nine pre-commit guard.
+#
+# Blocks a commit before it exists, which is the only moment that costs nothing.
+# A secret that reaches a remote is compromised even after a force-push: it is
+# in reflogs, in CI caches, in anyone's clone.
+#
+# Two layers: a built-in pattern scan that needs no tooling, and gitleaks when
+# it is installed. The built-in one is not optional, so a fresh machine is
+# never unprotected.
+#
+# Deliberate escape hatch: a line ending in "nine:allow-secret" is skipped, for
+# documented examples. Use it rarely and never for a real value.
+
+set -uo pipefail
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# ---------- 1. files that must never be committed ----------
+while IFS= read -r f; do
+  case "$f" in
+    *.env|.env|.env.*|*.pem|*.key|*.p12|*.pfx|*.keystore|*.jks|id_rsa|id_ed25519|*.mobileprovision|*serviceAccount*.json|*credentials.json)
+      case "$f" in
+        *.env.example|*.env.template|*.env.sample) ;;
+        *) red "BLOCKED  $f"; echo "         this file type carries credentials by convention"; fail=1 ;;
+      esac ;;
+  esac
+done <<< "$staged"
+
+# ---------- 2. secret patterns in the staged diff ----------
+# Each pattern is named so the message says what was found, never the value.
+scan_patterns=(
+  "AWS access key id|AKIA[0-9A-Z]{16}"
+  "OpenAI key|sk-[A-Za-z0-9]{32,}"
+  "Anthropic key|sk-ant-[A-Za-z0-9_-]{20,}"
+  "GitHub token|gh[pousr]_[A-Za-z0-9]{36,}"
+  "GitHub fine-grained token|github_pat_[A-Za-z0-9_]{50,}"
+  "Slack token|xox[baprs]-[A-Za-z0-9-]{10,}"
+  "Google API key|AIza[0-9A-Za-z_-]{35}"
+  "Stripe live key|[sr]k_live_[A-Za-z0-9]{20,}"
+  "Private key block|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+  "JSON Web Token|eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}"
+  "Connection string with inline password|://[A-Za-z0-9_.-]+:[^@/ \"']{6,}@"
+  "Hardcoded secret assignment|(password|passwd|secret|api[_-]?key|token|private[_-]?key)[[:space:]]*[:=][[:space:]]*[\"'][^\"'{}\$]{12,}[\"']"
+)
+
+diff_text=$(git diff --cached -U0 --diff-filter=ACM | grep '^+' | grep -v '^+++' || true)
+
+# The house style checks below run over a narrower diff: the guard's own source
+# is exempt, because it has to contain the very characters it hunts for. Every
+# other file is in scope.
+style_text=$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude)githooks/' \
+             | grep '^+' | grep -v '^+++' || true)
+style_text=$(printf '%s\n' "$style_text" | grep -v 'nine:allow-style' || true)
+# Honour the escape hatch and skip lock files, which are full of hash-like strings.
+diff_text=$(printf '%s\n' "$diff_text" | grep -v 'nine:allow-secret' || true)
+
+for entry in "${scan_patterns[@]}"; do
+  name="${entry%%|*}"; pat="${entry#*|}"
+  if printf '%s\n' "$diff_text" | grep -nEq "$pat"; then
+    n=$(printf '%s\n' "$diff_text" | grep -cE "$pat")
+    red "BLOCKED  $name"
+    echo "         $n matching line(s) in the staged diff. The value is not printed here on purpose."
+    echo "         Find it with: git diff --cached | grep -nE '$pat'"
+    fail=1
+  fi
+done
+
+# ---------- 3. gitleaks, when present ----------
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --no-banner --redact -c .gitleaks.toml >/tmp/gitleaks-out 2>&1; then
+    red "BLOCKED  gitleaks found a secret"
+    sed 's/^/         /' /tmp/gitleaks-out | head -20
+    fail=1
+  fi
+else
+  ylw "note     gitleaks is not installed; the built-in scan ran alone. brew install gitleaks"
+fi
+
+# ---------- 4. house style ----------
+if printf '%s\n' "$style_text" | grep -q '—'; then
+  red "BLOCKED  em dash in the staged diff"
+  echo "         Nine writes with commas and colons. Replace it."
+  fail=1
+fi
+
+if printf '%s\n' "$style_text" | grep -qE '[çğıöşüÇĞİÖŞÜ]'; then
+  red "BLOCKED  non-English characters in the staged diff"
+  echo "         Code, comments and docs in Nine are English."
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  red "commit refused."
+  echo "If a match is a documented example rather than a real value, end that line with: nine:allow-secret"
+  exit 1
+fi
+
+grn "pre-commit checks passed"

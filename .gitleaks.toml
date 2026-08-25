@@ -1,0 +1,25 @@
+# Nine gitleaks configuration.
+#
+# Extends the upstream default ruleset rather than replacing it: the defaults
+# already know hundreds of provider formats, and a hand-written list would
+# quietly fall behind.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths and values that are examples, not secrets"
+paths = [
+  '''.*\.lock$''',
+  '''.*lock\.json$''',
+  '''go\.sum$''',
+  '''.*\.env\.example$''',
+]
+regexes = [
+  # Documented placeholders. These must never look like real values.
+  '''PASTE-[A-Z-]+''',
+  '''your-[a-z-]+-here''',
+  '''nk_dev_[a-z_0-9]+''',
+  '''nine_app_dev''',
+  '''dev-bootstrap''',
+]
+stopwords = ["example", "placeholder", "changeme"]
