@@ -29,14 +29,14 @@ This repository is the **core** component. The others:
 
 | Repo | Language | Role |
 |---|---|---|
-| [ingest](https://github.com/canakyuz/nine-ingest) | Go | Event intake, auth, rate limiting |
-| [core](https://github.com/canakyuz/nine-core) | Go | Queue consumers, aggregation, storage |
-| [api](https://github.com/canakyuz/nine-api) | Go | Query API, caching |
-| [web](https://github.com/canakyuz/nine-web) | TypeScript | Dashboard |
-| [platform](https://github.com/canakyuz/nine-platform) | HCL | Deployment, scaling, observability |
-| [sdk](https://github.com/canakyuz/nine-sdk) | TS / Go / Python | Client libraries |
-| [bench](https://github.com/canakyuz/nine-bench) | Python | Load and chaos testing |
-| [docs](https://github.com/canakyuz/nine-docs) | Markdown | Decisions and measurements |
+| [ingest](https://github.com/ennaton/nine-ingest) | Go | Event intake, auth, rate limiting |
+| [core](https://github.com/ennaton/nine-core) | Go | Queue consumers, aggregation, storage |
+| [api](https://github.com/ennaton/nine-api) | Go | Query API, caching |
+| [web](https://github.com/ennaton/nine-web) | TypeScript | Dashboard |
+| [platform](https://github.com/ennaton/nine-platform) | HCL | Deployment, scaling, observability |
+| [sdk-js](https://github.com/ennaton/nine-sdk-js) | TS / Go / Python | Client libraries |
+| [bench](https://github.com/ennaton/nine-bench) | Python | Load and chaos testing |
+| [docs](https://github.com/ennaton/nine-docs) | Markdown | Decisions and measurements |
 
 ## Development
 
@@ -47,12 +47,12 @@ This repository is the **core** component. The others:
 ## Measurements
 
 Every performance claim about this component links to a reproducible run in
-[nine-bench](https://github.com/canakyuz/nine-bench) and a written report in
-[nine-docs](https://github.com/canakyuz/nine-docs). No number without a method.
+[nine-bench](https://github.com/ennaton/nine-bench) and a written report in
+[nine-docs](https://github.com/ennaton/nine-docs). No number without a method.
 
 ## Roadmap
 
-See [nine-docs](https://github.com/canakyuz/nine-docs) for the phase plan.
+See [nine-docs](https://github.com/ennaton/nine-docs) for the phase plan.
 
 ## License
 
