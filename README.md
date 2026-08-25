@@ -33,7 +33,7 @@ This repository is the **core** component. The others:
 | [core](https://github.com/canakyuz/nine-core) | Go | Queue consumers, aggregation, storage |
 | [api](https://github.com/canakyuz/nine-api) | Go | Query API, caching |
 | [web](https://github.com/canakyuz/nine-web) | TypeScript | Dashboard |
-| [infra](https://github.com/canakyuz/nine-infra) | HCL | Deployment, scaling, observability |
+| [platform](https://github.com/canakyuz/nine-platform) | HCL | Deployment, scaling, observability |
 | [sdk](https://github.com/canakyuz/nine-sdk) | TS / Go / Python | Client libraries |
 | [bench](https://github.com/canakyuz/nine-bench) | Python | Load and chaos testing |
 | [docs](https://github.com/canakyuz/nine-docs) | Markdown | Decisions and measurements |
