@@ -55,7 +55,9 @@ diff_text=$(git diff --cached -U0 --diff-filter=ACM | grep '^+' | grep -v '^+++'
 # The house style checks below run over a narrower diff: the guard's own source
 # is exempt, because it has to contain the very characters it hunts for. Every
 # other file is in scope.
-style_text=$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude)githooks/' \
+# --text keeps git from replacing a binary hunk with "Binary files differ",
+# and the style rules below only ever look at added text lines.
+style_text=$(git diff --cached -U0 --diff-filter=ACM --text -- . ':(exclude)githooks/' \
              | grep '^+' | grep -v '^+++' || true)
 style_text=$(printf '%s\n' "$style_text" | grep -v 'nine:allow-style' || true)
 # Honour the escape hatch and skip lock files, which are full of hash-like strings.
