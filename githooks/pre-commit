@@ -36,6 +36,8 @@ done <<< "$staged"
 # ---------- 2. secret patterns in the staged diff ----------
 # Each pattern is named so the message says what was found, never the value.
 scan_patterns=(
+  "Nine API key|nk_[A-Za-z0-9_-]{32,}"
+  "AWS secret access key|(AWS|Aws|aws)_?(SECRET|Secret|secret)_?(ACCESS|Access|access)_?(KEY|Key|key)[[:space:]]*[:=][[:space:]]*.?[A-Za-z0-9/+=]{40}"
   "AWS access key id|AKIA[0-9A-Z]{16}"
   "OpenAI key|sk-[A-Za-z0-9]{32,}"
   "Anthropic key|sk-ant-[A-Za-z0-9_-]{20,}"
