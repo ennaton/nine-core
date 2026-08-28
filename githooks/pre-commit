@@ -97,7 +97,12 @@ if printf '%s\n' "$style_text" | grep -q '—'; then
   fail=1
 fi
 
-if printf '%s\n' "$style_text" | grep -qE '[çğıöşüÇĞİÖŞÜ]'; then
+# Alternation rather than a bracket expression. A bracket expression built from
+# multibyte characters is matched byte by byte, so it fires on any UTF-8 sequence
+# that happens to share a byte: the box drawing arrow in an ASCII diagram is
+# E2 96 B6, and B6 is also the second byte of o with diaeresis. Each alternative
+# here is a whole character, so only the character itself matches.
+if printf '%s\n' "$style_text" | grep -qE 'ç|ğ|ı|ö|ş|ü|Ç|Ğ|İ|Ö|Ş|Ü'; then
   red "BLOCKED  non-English characters in the staged diff"
   echo "         Code, comments and docs in Nine are English."
   fail=1
