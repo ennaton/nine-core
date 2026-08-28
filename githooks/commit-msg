@@ -29,7 +29,18 @@ if printf '%s' "$subject" | grep -q '—'; then
   exit 1
 fi
 
-if printf '%s\n' "$body" | grep -qiE 'co-authored-by|generated with|🤖'; then
-  red "commit refused: no co-author or generator trailers in Nine history"
+if printf '%s\n' "$body" | grep -qiE 'generated with|🤖'; then
+  red "commit refused: no generator trailers in Nine history"
+  exit 1
+fi
+
+# Co-authorship is for people. A ping-pong handover is real work by a second
+# person, and the contribution graph is the only place that work shows, so the
+# trailer is allowed and expected there. A tool that produced the diff is not an
+# author: a trailer naming an assistant turns the graph into a fiction, and that
+# half of the old rule stays.
+if printf '%s\n' "$body" | grep -qiE '^co-authored-by:.*(claude|anthropic|copilot|codex|cursor|\[bot\]|bot@|noreply@)'; then
+  red "commit refused: a co-author trailer names a person, not a tool"
+  echo "  Co-Authored-By is for the other human who wrote part of this commit."
   exit 1
 fi
