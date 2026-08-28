@@ -22,7 +22,7 @@ Turning the raw event log into queryable data. Everything that is not the edge a
 
 ## Rules every Nine repo shares
 
-**Language.** Code, comments, commit messages, docs and UI strings are English. No exceptions, including in files nobody reads yet.
+**Language.** Code, comments, commit messages, docs, artifacts and UI strings are English. No exceptions, including in files nobody reads yet, and including an artifact whose subject was discussed in another language: it is written in English at the moment it is written, not translated afterwards. `githooks/pre-commit` blocks the added lines and the `house-style` CI job scans the whole tree, so a file that predates the rule fails the build until it is rewritten.
 
 **No em dashes.** Commas and colons instead. The pre-commit hook blocks them.
 
