@@ -1,0 +1,17 @@
+# Whoever did not write it, reviews it.
+#
+# GitHub never requests a review from the author, so listing both names against
+# every path means exactly one thing: every pull request goes to the other person.
+# That is the board's rule, "you are the mandatory reviewer in every group whose
+# decision you do not own", expressed as the only thing a path file can express.
+#
+# Deliberately not split by path. Decision ownership is per group and it moves
+# between sprints; file ownership would have to be rewritten to stay true, and a
+# CODEOWNERS file that has drifted is worse than none. A narrower rule is also a
+# trap: naming one owner on a path removes the second reviewer for every change
+# that owner writes.
+#
+# This file requests reviewers. It does not stop a push to main. That takes branch
+# protection with "require a pull request" and "require review from Code Owners".
+
+*    @canakyuz @MustafaKemalV
