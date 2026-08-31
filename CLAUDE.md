@@ -22,7 +22,9 @@ Turning the raw event log into queryable data. Everything that is not the edge a
 
 ## Rules every Nine repo shares
 
-**Language.** Code, comments, commit messages, docs, artifacts and UI strings are English. No exceptions, including in files nobody reads yet, and including an artifact whose subject was discussed in another language: it is written in English at the moment it is written, not translated afterwards. `githooks/pre-commit` blocks the added lines and the `house-style` CI job scans the whole tree, so a file that predates the rule fails the build until it is rewritten.
+**Language.** Code, comments, commit messages, docs, artifacts and UI strings are English. One exception, named rather than left to judgement, and the rest of the sentence holds without it: including in files nobody reads yet, and including an artifact whose subject was discussed in another language, which is written in English at the moment it is written and not translated afterwards. `githooks/pre-commit` blocks the added lines and the `house-style` CI job scans the whole tree, so a file that predates the rule fails the build until it is rewritten.
+
+**The working board is the exception, and it has to live under version control.** `nine-calisma-panosu.md` is the one document the two of us plan in rather than publish, and the planning happens in Turkish. Holding it to the rule above is what kept it outside every repository, and the cost of that was measured on 31 August: a hundred and fifty task rows, every status, every assignment and every dated measurement, in a single untracked file with no history and no copy anywhere. A rule that pushes the most important document out of version control is the rule that is wrong, not the document. So the board may be Turkish, and it may not be outside a repository. Nothing else is exempt: a rule with one named exception is still a rule, and a rule with a category of exceptions is not.
 
 **No em dashes.** Commas and colons instead. The pre-commit hook blocks them.
 
