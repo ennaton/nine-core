@@ -1,6 +1,6 @@
 # nine-core
 
-Queue consumer and aggregation. Kafka for the event log, RabbitMQ for retries and DLQ.
+Queue consumer and aggregation. Kafka for the event log, and for retries and the dead letter queue.
 
 Part of **Nine**, telemetry for AI coding agents.
 An agent runs, leaves a trail; Nine collects it and makes it queryable.
@@ -20,8 +20,10 @@ answers those questions.
 
 ```
 agent -> [ingest] -> Kafka ----> [core] -> Postgres
-             |                              ^
-          RabbitMQ -> retry/DLQ             |
+                       |                    ^
+                       +-> events.retry-5m  |
+                       +-> events.retry-1h  |
+                       +-> events.dlq       |
                                     [api] <-+- Redis <- [web]
 ```
 
