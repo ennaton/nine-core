@@ -37,9 +37,30 @@ fi
 # Co-authorship is for people. A ping-pong handover is real work by a second
 # person, and the contribution graph is the only place that work shows, so the
 # trailer is allowed and expected there. A tool that produced the diff is not an
-# author: a trailer naming an assistant turns the graph into a fiction, and that
-# half of the old rule stays.
-if printf '%s\n' "$body" | grep -qiE '^co-authored-by:.*(claude|anthropic|copilot|codex|cursor|\[bot\]|bot@|noreply@)'; then
+# author: a trailer naming an assistant turns the graph into a fiction.
+#
+# The check is not on `Co-Authored-By` alone, because three ways past that
+# version were found and all three passed it: `Claude-Session: https://x` names
+# the tool in the key and never in the value, `Assisted-By: Claude <a@b.c>` uses
+# a key nobody had enumerated, and two spaces in front of `Co-Authored-By:`
+# defeated the `^` anchor. Git strips none of the three.
+#
+# So two rules instead of one list. A trailer whose KEY names a tool is refused
+# whatever its value. A trailer whose key attributes authorship, anything ending
+# in `-by` plus `author`, `authors` and `committer`, is refused when its VALUE
+# names a tool. Splitting it this way is what keeps `Note: cursor position is
+# wrong` and `Refs: AP4.1 cursor pagination` legal, which a single scan for the
+# word would not.
+tools='claude|anthropic|copilot|codex|cursor|chatgpt|openai|gemini|\[bot\]|bot@|noreply@'
+attribution='^[[:space:]]*([A-Za-z][A-Za-z-]*-by|authors?|committer)[[:space:]]*:'
+
+bad_key=$(printf '%s\n' "$body" | grep -iE "^[[:space:]]*[A-Za-z][A-Za-z-]*($tools)[A-Za-z-]*[[:space:]]*:" || true)
+if [ -n "$bad_key" ] || printf '%s\n' "$body" | grep -iqE "^[[:space:]]*($tools)[A-Za-z-]*[[:space:]]*:"; then
+  red "commit refused: a trailer key names a tool, and a tool is not an author"
+  exit 1
+fi
+
+if printf '%s\n' "$body" | grep -iE "$attribution" | grep -qiE "$tools"; then
   red "commit refused: a co-author trailer names a person, not a tool"
   echo "  Co-Authored-By is for the other human who wrote part of this commit."
   exit 1
