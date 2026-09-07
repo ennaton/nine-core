@@ -14,7 +14,7 @@ Turning the raw event log into queryable data. Everything that is not the edge a
 
 **Idempotent by construction.** The same event replayed from the log must not double count. The event id is the key; a unique constraint enforces it, not an application check that races.
 
-**Retry and dead letter live on Kafka.** The topic chain is `events -> events.retry-5m -> events.retry-1h -> events.dlq`. A second broker is not added until a measurement shows the retry chain is insufficient, and the decision gets written up either way.
+**Retry and dead letter live on Kafka.** The topic chain is `events -> events.retry-5m -> events.retry-1h -> events.parked`: two rounds, and a message that failed both is parked for replay once the dependency is back. `events.dlq` is not on the chain; a `Poison` goes there on first sight, because it will never process and the only useful action is a person reading it. The mapping, the count and the split are `nine-docs/adr/0001`. A second broker is not added until a measurement shows the retry chain is insufficient, and the decision gets written up either way.
 
 **Postgres holds the truth.** Time-partitioned events plus precomputed rollups. Every query that matters carries an `EXPLAIN` in the pull request that introduced it.
 

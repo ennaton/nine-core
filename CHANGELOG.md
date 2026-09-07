@@ -9,3 +9,6 @@ Each repository versions independently.
 
 ### Added
 - Repository scaffold.
+
+### Changed
+- The chain described in `CLAUDE.md` and the README ends in `events.parked`, not `events.dlq`: a `Retry` that used both rounds is parked for replay, a `Poison` goes to the dlq on first sight. Decided in `nine-docs/adr/0001`.
