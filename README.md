@@ -23,6 +23,7 @@ agent -> [ingest] -> Kafka ----> [core] -> Postgres
                        |                    ^
                        +-> events.retry-5m  |
                        +-> events.retry-1h  |
+                       +-> events.parked    |
                        +-> events.dlq       |
                                     [api] <-+- Redis <- [web]
 ```
