@@ -377,3 +377,50 @@ type sinkFunc func(context.Context, *kgo.Record, pipeline.Outcome) error
 func (f sinkFunc) Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome) error {
 	return f(ctx, r, o)
 }
+
+// What CO2.4 needs from the seam, in @MustafaKemalV's words on 0002: it is
+// not enough that a test can stop the process between the database commit
+// and the offset commit, the process has to tell the test it is standing
+// there, or the test falls back to timing and a test that reads timing lies
+// one day. The hook is that signal: the test blocks in it, and while blocked
+// it reads the state of the window from the broker, not from a clock.
+func TestTheSeamTellsTheTestWhereItStands(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 3)
+	h := &answer{}
+	atSeam := make(chan struct{})
+	release := make(chan struct{})
+	hook := func(context.Context, []*kgo.Record) error {
+		close(atSeam)
+		<-release
+		return nil
+	}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h, WithCommitHook[decoded](hook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	select {
+	case <-atSeam:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the seam was never reached")
+	}
+	// Standing in the window: the handler has returned for every record, the
+	// broker has been told nothing. This is the state CO2.4 kills the process in.
+	if h.count() != 3 {
+		t.Fatalf("handler returned for %d records, want 3", h.count())
+	}
+	if got := committed(t, brokers, "core"); got != 0 {
+		t.Fatalf("committed %d while standing before the offset commit, want 0", got)
+	}
+	close(release)
+	waitFor(t, "the commit after the seam", func() bool { return committed(t, brokers, "core") == 3 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
