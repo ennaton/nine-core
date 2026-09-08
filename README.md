@@ -43,9 +43,19 @@ This repository is the **core** component. The others:
 
 ## Development
 
+Go 1.26 and the compose stack from
+[nine-platform](https://github.com/ennaton/nine-platform) for a broker.
+
 ```bash
-# requirements and setup land here once the component has code
+go test -race ./...                       # the broker is franz-go's in process kfake, no Docker
+NINE_KAFKA_BROKERS=localhost:19092 go run ./cmd/core   # joins group "core" on topic "events"
 ```
+
+Two instances of `cmd/core` split the topic between them and the rebalance is
+visible in both logs; `docs/artifacts/2026-09-08-co2-1-two-instances-rebalance.md`
+is one such run against the compose broker. Offsets are committed by hand and
+only for records the handler answered `Done`; the order, database first and
+offset second, is `nine-docs/adr/0002`.
 
 ## Measurements
 
