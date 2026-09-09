@@ -99,8 +99,26 @@ A test that had read that line would believe the consumer was standing before th
 offset commit while the commit had already happened, which is this document's own
 opening complaint arriving by a different road: it passes for the wrong reason.
 
-So EOF before a release line is its own exit, 98, and never a return. What landed
-carries it, and `CO2.5` is written against three outcomes rather than two.
+So EOF before a release line is its own exit, 98, and never a return. Measured
+on what landed, the tagged binary from `nine-core#12`, against the compose
+broker, first with stdin closed and then with a fifo the test holds open:
+
+```
+NINE_FAULT_AFTER_DB_COMMIT=pause ./core-fault </dev/null
+nine-fault-reached: AFTER_DB_COMMIT
+nine-fault: stdin ended before a release line: EOF
+exit=98        committed offsets: 0
+
+NINE_FAULT_AFTER_DB_COMMIT=pause ./core-fault <fifo
+nine-fault-reached: AFTER_DB_COMMIT      committed offsets: 0    <- the window
+echo go >fifo                            committed offsets: 27   <- released
+```
+
+The second block is the handshake `CO2.5` stands on: the announcement arrives
+while nothing is committed, and the commit happens only after the release. The
+numbers are read from the broker rather than from the process, so neither side
+of the window depends on the consumer saying so. `CO2.5` is written against
+three outcomes rather than two.
 
 ## Why stdout and stdin rather than something cleverer
 
