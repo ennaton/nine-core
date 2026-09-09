@@ -30,10 +30,20 @@ import (
 func ownerDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("NINE_TEST_MIGRATE_DSN")
-	if dsn == "" {
-		t.Skip("NINE_TEST_MIGRATE_DSN unset: no PostgreSQL to measure against")
+	if dsn != "" {
+		return dsn
 	}
-	return dsn
+	// A skip is right on a laptop with no stack and wrong in CI, where it is
+	// indistinguishable from a pass: measured, this package reports 41.0
+	// percent coverage with every database test skipped and 88.5 with them
+	// run, and both print "ok". So the day the service container is dropped
+	// from the workflow, or the variable is renamed, the build must go red
+	// rather than green over six tests that did not happen.
+	if os.Getenv("CI") != "" {
+		t.Fatal("NINE_TEST_MIGRATE_DSN is unset in CI: the workflow's postgres service is gone, and skipping here would report success for tests that never ran")
+	}
+	t.Skip("NINE_TEST_MIGRATE_DSN unset: no PostgreSQL to measure against")
+	return ""
 }
 
 // fresh creates a throwaway database, migrates it, and returns a Store on
