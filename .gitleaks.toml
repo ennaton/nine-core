@@ -20,6 +20,7 @@ regexes = [
   '''your-[a-z-]+-here''',
   '''nk_dev_[a-z_0-9]+''',
   '''nine_app_dev''',
+  '''postgres:postgres@localhost''',
   '''dev-bootstrap''',
 ]
 stopwords = ["example", "placeholder", "changeme"]

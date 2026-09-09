@@ -230,6 +230,13 @@ func (c *Consumer[T]) process(ctx context.Context, fetches kgo.Fetches) (acked [
 	for !iter.Done() {
 		r := iter.Next()
 		if err := c.one(ctx, r); err != nil {
+			if ctx.Err() != nil {
+				// The handler failed because the shutdown cancelled the
+				// context under it, not because of the record. What was
+				// accounted for before it is committed by the caller; this
+				// record and the rest stay uncommitted and come back.
+				return acked, nil
+			}
 			return acked, err
 		}
 		acked = append(acked, r)

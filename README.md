@@ -48,8 +48,24 @@ Go 1.26 and the compose stack from
 
 ```bash
 go test -race ./...                       # the broker is franz-go's in process kfake, no Docker
-NINE_KAFKA_BROKERS=localhost:19092 go run ./cmd/core   # joins group "core" on topic "events"
+NINE_TEST_MIGRATE_DSN=postgres://postgres:postgres@localhost:15432/postgres go test -race ./internal/store/   # nine:allow-secret, the compose owner
+go run ./cmd/migrate                      # applies the events schema to nine_core, as the owner
+NINE_KAFKA_BROKERS=localhost:19092 go run ./cmd/core   # joins group "core" on topic "events", writes as nine_app
 ```
+
+`cmd/migrate` reads `NINE_CORE_MIGRATE_DSN` and `cmd/core` reads
+`NINE_CORE_DSN`; both default to the compose stack. They are two binaries on
+purpose: the consumer connects as `nine_app`, which owns nothing and can only
+insert and read, so it never holds the owner's password.
+
+The `events` table is the shape measured in
+`docs/artifacts/2026-08-28-events-partition-interval.md`, weekly range
+partitions on `occurred_at`, and the insert is `ON CONFLICT (tenant_id,
+event_id, occurred_at) DO NOTHING`: the same event twice is one row, per
+tenant, and a partitioned table forces the third column into the key
+(`nine-docs/adr/0002`). The first migration creates twelve weekly partitions
+from 31 August 2026 as a horizon; the mechanism that creates the next one is
+CO3.2, and until it lands an event dated outside the horizon is a `Retry`.
 
 Two instances of `cmd/core` split the topic between them and the rebalance is
 visible in both logs; `docs/artifacts/2026-09-08-co2-1-two-instances-rebalance.md`
