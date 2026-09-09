@@ -62,7 +62,8 @@ offset second, is `nine-docs/adr/0002`.
 `go build -tags faultinject ./cmd/core` produces the binary the crash tests
 kill: `NINE_FAULT_AFTER_DB_COMMIT=exit` leaves with code 97 between the
 handlers and the offset commit, `=pause` prints `nine-fault-reached` and waits
-on stdin. The plain build does not contain the variable's name, and CI checks
+on stdin, or leaves with code 98 if stdin ends first, so a closed stdin is a
+failure the test sees and not a pause that never happened. The plain build does not contain the variable's name, and CI checks
 that on every push.
 
 ## Measurements
