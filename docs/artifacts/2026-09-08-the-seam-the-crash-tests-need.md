@@ -80,6 +80,28 @@ first one by writing a line. Measured end to end, with no sleep anywhere:
 3. line: offset committed   exit code: 0
 ```
 
+**A third outcome, because the first two were not enough.** The design as first
+written had a hole that `@canakyuz` found and that I then reproduced: run the
+tagged binary with stdin closed, which is how docker and systemd start a service,
+and `ReadString` returns EOF at once. Measured on the design exactly as written
+here:
+
+```
+NINE_FAULT_AFTER_DB_COMMIT=pause ./test </dev/null
+database committed
+nine-fault-reached: AFTER_DB_COMMIT
+offset committed
+exit=0
+```
+
+The announcement was printed and the process walked straight through the window.
+A test that had read that line would believe the consumer was standing before the
+offset commit while the commit had already happened, which is this document's own
+opening complaint arriving by a different road: it passes for the wrong reason.
+
+So EOF before a release line is its own exit, 98, and never a return. What landed
+carries it, and `CO2.5` is written against three outcomes rather than two.
+
 ## Why stdout and stdin rather than something cleverer
 
 A file needs a path, a cleanup and a race on creation. A port needs a number that
@@ -87,12 +109,28 @@ is free. Both are state the test has to manage and something else can collide
 with. The child process already has two pipes the parent owns, and a line on each
 is a handshake with no shared resource, no polling and nothing to clean up.
 
-## What this asks of `CO2.1`
+## What landed, which is not quite the shape above
 
-Only that the point exists where the decision in `nine-docs/adr/0002` puts it:
-after the database transaction returns, before the offset is committed, and
-inside neither. One line, guarded by a constant, plus the two files above.
+`CO2.1` merged as `nine-core#12` and the seam it carries is a combination of this
+design and the one that was already being written, which is better than either.
+The tag lives in `cmd/core`, not in the consumer: `fault_on.go` installs
+`consumer.WithCommitHook(pauseOrCrash)` and `fault_off.go` adds nothing, so the
+seam itself is an ordinary library option and only the crash binary ever reaches
+for it. A `CO2.4` written from the shape section above would look for
+`if faultInjection` inside the consumer and not find it.
 
-The build tag is worth a line in CI: a job that greps the shipped binary for
-`NINE_FAULT` and fails if it finds it costs nothing and turns the table above
-into a standing guarantee rather than a measurement someone took once.
+The build tag is in CI, which was the point of writing the table above rather
+than taking the measurement once. `.github/workflows/ci.yml` builds both binaries
+on every push and fails if `NINE_FAULT` appears in the shipped one:
+
+```
+go build -o /tmp/core ./cmd/core
+if grep -q NINE_FAULT /tmp/core; then echo "NINE_FAULT is in the shipped binary"; exit 1; fi
+go build -tags faultinject -o /tmp/core-fault ./cmd/core
+grep -q NINE_FAULT /tmp/core-fault
+```
+
+The numbers in the table came from a scratch module on go1.25.4, because this
+repository asks for go1.26.4 and the machine that measured it had 1.25. They are
+kept for the reasoning rather than as the current figures: the CI job above is
+now the standing answer, on the repository's own toolchain, on every push.
