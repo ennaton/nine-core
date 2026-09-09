@@ -1,0 +1,509 @@
+package consumer
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/ennaton/nine-core/internal/pipeline"
+)
+
+// The broker is kfake, franz-go's in process cluster. It speaks the group
+// protocol, so two members really do split partitions and really do rebalance;
+// what it does not prove is the real broker's timing, which the artifact for
+// CO2.1 measures against the compose stack once.
+
+const topic = "events"
+
+func cluster(t *testing.T, partitions int32) []string {
+	t.Helper()
+	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(partitions, topic))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	return c.ListenAddrs()
+}
+
+func produce(t *testing.T, brokers []string, n int) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	recs := make([]*kgo.Record, n)
+	for i := range recs {
+		recs[i] = &kgo.Record{Topic: topic, Key: []byte(fmt.Sprintf("tenant-%d", i%3)), Value: []byte(fmt.Sprintf("event-%d", i))}
+	}
+	if err := cl.ProduceSync(context.Background(), recs...).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// committed sums the group's committed offsets over every partition, which is
+// the number of records the group has acknowledged. It is read from the
+// broker, not from the consumer, because the claim is about what the broker
+// would hand to the next member.
+func committed(t *testing.T, brokers []string, group string) int64 {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	offsets, err := kadm.NewClient(cl).FetchOffsets(context.Background(), group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum int64
+	offsets.Each(func(o kadm.OffsetResponse) { sum += o.At })
+	return sum
+}
+
+type decoded struct{ tenant, id string }
+
+func decode(key, value []byte) (decoded, error) {
+	if len(value) == 0 {
+		return decoded{}, errors.New("empty")
+	}
+	return decoded{tenant: string(key), id: string(value)}, nil
+}
+
+// answer is a handler scripted per event id, Done unless told otherwise.
+type answer struct {
+	mu   sync.Mutex
+	seen []string
+	by   map[string]pipeline.Outcome
+}
+
+func (a *answer) Handle(_ context.Context, m decoded) (pipeline.Outcome, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seen = append(a.seen, m.id)
+	if o, ok := a.by[m.id]; ok {
+		return o, errors.New("scripted")
+	}
+	return pipeline.Done, nil
+}
+
+func (a *answer) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.seen)
+}
+
+// assignments follows what each member currently holds, from the same slog
+// lines the operator would read: an assignment adds, a revocation removes.
+// Cooperative rebalancing tells a joining member "assigned nothing" first and
+// hands it partitions in a second round, so the history is what matters, not
+// the first line.
+type assignments struct {
+	mu      sync.Mutex
+	holds   map[string]map[int32]bool
+	revoked int
+}
+
+func (a *assignments) holding(member string) []int32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []int32
+	for p := range a.holds[member] {
+		out = append(out, p)
+	}
+	return out
+}
+
+func (a *assignments) logger(member string) *slog.Logger {
+	return slog.New(&capture{member: member, a: a})
+}
+
+type capture struct {
+	member string
+	a      *assignments
+	attrs  []slog.Attr
+}
+
+func (c *capture) Enabled(context.Context, slog.Level) bool { return true }
+func (c *capture) WithGroup(string) slog.Handler            { return c }
+func (c *capture) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &capture{member: c.member, a: c.a, attrs: append(append([]slog.Attr{}, c.attrs...), attrs...)}
+}
+func (c *capture) Handle(_ context.Context, r slog.Record) error {
+	var parts []int32
+	r.Attrs(func(at slog.Attr) bool {
+		if at.Key == "partitions" {
+			parts, _ = at.Value.Any().([]int32)
+		}
+		return true
+	})
+	c.a.mu.Lock()
+	defer c.a.mu.Unlock()
+	if c.a.holds == nil {
+		c.a.holds = map[string]map[int32]bool{}
+	}
+	if c.a.holds[c.member] == nil {
+		c.a.holds[c.member] = map[int32]bool{}
+	}
+	switch r.Message {
+	case "partitions assigned":
+		for _, p := range parts {
+			c.a.holds[c.member][p] = true
+		}
+	case "partitions revoked":
+		c.a.revoked++
+		for _, p := range parts {
+			delete(c.a.holds[c.member], p)
+		}
+	}
+	return nil
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestTwoMembersSplitThePartitionsAndCommitOnlyByHand(t *testing.T) {
+	brokers := cluster(t, 3)
+	produce(t, brokers, 30)
+
+	as := &assignments{}
+	h := &answer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	start := func(name string) {
+		c, err := New(Config{Brokers: brokers, Group: "core", Log: as.logger(name), Session: 6 * time.Second}, decode, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer c.Close()
+			if err := c.Run(ctx); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	// The second member joins only once the first holds the whole topic, so
+	// the rebalance is forced rather than folded into one initial join.
+	start("a")
+	waitFor(t, "a holds the whole topic", func() bool { return len(as.holding("a")) == 3 })
+	start("b")
+
+	waitFor(t, "30 records handled", func() bool { return h.count() >= 30 })
+	waitFor(t, "30 offsets committed", func() bool { return committed(t, brokers, "core") == 30 })
+
+	// The rebalance is done when the two members hold every partition once
+	// between them and both hold something. Read before they leave: leaving
+	// revokes everything, which is correct and not what this measures.
+	split := func() bool {
+		held := map[int32]int{}
+		for _, member := range []string{"a", "b"} {
+			parts := as.holding(member)
+			if len(parts) == 0 {
+				return false
+			}
+			for _, p := range parts {
+				held[p]++
+			}
+		}
+		for p := int32(0); p < 3; p++ {
+			if held[p] != 1 {
+				return false
+			}
+		}
+		return true
+	}
+	waitFor(t, "the topic split between a and b", split)
+	as.mu.Lock()
+	revoked := as.revoked
+	as.mu.Unlock()
+	cancel()
+	wg.Wait()
+
+	if revoked == 0 {
+		t.Error("no revocation was logged before the split, so a gave nothing up and b took nothing")
+	}
+	if h.count() != 30 {
+		t.Errorf("handled %d records, want 30: a record was delivered twice or not at all", h.count())
+	}
+}
+
+func TestFatalStopsWithoutCommittingItsOffset(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 5)
+
+	h := &answer{by: map[string]pipeline.Outcome{"event-2": pipeline.Fatal}}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Run(context.Background())
+	c.Close()
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run returned %v, want a stop", err)
+	}
+	// The two Done records before the Fatal one are committed, the Fatal one
+	// and everything after it are not: they come back to the next member.
+	if got := committed(t, brokers, "core"); got != 2 {
+		t.Fatalf("committed %d, want 2", got)
+	}
+
+	// A fresh member sees event-2 again. Nothing was lost by stopping.
+	h2 := &answer{}
+	c2, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c2.Run(ctx) }()
+	waitFor(t, "redelivery", func() bool { return h2.count() >= 3 })
+	cancel()
+	c2.Close()
+	if h2.seen[0] != "event-2" {
+		t.Fatalf("first redelivered record is %s, want event-2", h2.seen[0])
+	}
+}
+
+func TestRetryWithNoSinkStops(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 2)
+	h := &answer{by: map[string]pipeline.Outcome{"event-0": pipeline.Retry}}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Run(context.Background())
+	c.Close()
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run returned %v, want a stop: a Retry with nowhere to go must not be dropped", err)
+	}
+	if got := committed(t, brokers, "core"); got != 0 {
+		t.Fatalf("committed %d, want 0", got)
+	}
+}
+
+// The seam of nine-docs/adr/0002: the handler has returned Done for the whole
+// batch, the offsets are not yet committed, and the process dies here. The
+// hook stands in for the kill. Nothing is committed and every record comes back.
+func TestCommitHookRefusingLeavesTheBatchForTheNextMember(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 4)
+	h := &answer{}
+	crash := func(context.Context, []*kgo.Record) error { return errors.New("killed between the two commits") }
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h, WithCommitHook[decoded](crash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Run(context.Background())
+	c.Close()
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run returned %v, want a stop", err)
+	}
+	if h.count() != 4 {
+		t.Fatalf("handler saw %d records before the crash, want 4", h.count())
+	}
+	if got := committed(t, brokers, "core"); got != 0 {
+		t.Fatalf("committed %d after the crash, want 0", got)
+	}
+	h2 := &answer{}
+	c2, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c2.Run(ctx) }()
+	waitFor(t, "all four redelivered", func() bool { return h2.count() >= 4 })
+	cancel()
+	c2.Close()
+	waitFor(t, "four committed by the second member", func() bool { return committed(t, brokers, "core") == 4 })
+}
+
+func TestARecordThatDoesNotDecodeIsPoison(t *testing.T) {
+	brokers := cluster(t, 1)
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ProduceSync(context.Background(), &kgo.Record{Topic: topic, Key: []byte("t"), Value: nil}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	cl.Close()
+	forwarded := make(chan pipeline.Outcome, 1)
+	sink := sinkFunc(func(_ context.Context, _ *kgo.Record, o pipeline.Outcome) error { forwarded <- o; return nil })
+	h := &answer{}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h, WithSink[decoded](sink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Run(ctx) }()
+	select {
+	case o := <-forwarded:
+		if o != pipeline.Poison {
+			t.Fatalf("forwarded as %v, want Poison", o)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("nothing forwarded")
+	}
+	waitFor(t, "poison committed after forward", func() bool { return committed(t, brokers, "core") == 1 })
+	cancel()
+	c.Close()
+	if h.count() != 0 {
+		t.Fatal("the handler saw a record that did not decode")
+	}
+}
+
+type sinkFunc func(context.Context, *kgo.Record, pipeline.Outcome) error
+
+func (f sinkFunc) Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome) error {
+	return f(ctx, r, o)
+}
+
+// What CO2.4 needs from the seam, in @MustafaKemalV's words on 0002: it is
+// not enough that a test can stop the process between the database commit
+// and the offset commit, the process has to tell the test it is standing
+// there, or the test falls back to timing and a test that reads timing lies
+// one day. The hook is that signal: the test blocks in it, and while blocked
+// it reads the state of the window from the broker, not from a clock.
+func TestTheSeamTellsTheTestWhereItStands(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 3)
+	h := &answer{}
+	atSeam := make(chan struct{})
+	release := make(chan struct{})
+	hook := func(context.Context, []*kgo.Record) error {
+		close(atSeam)
+		<-release
+		return nil
+	}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h, WithCommitHook[decoded](hook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	select {
+	case <-atSeam:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the seam was never reached")
+	}
+	// Standing in the window: the handler has returned for every record, the
+	// broker has been told nothing. This is the state CO2.4 kills the process in.
+	if h.count() != 3 {
+		t.Fatalf("handler returned for %d records, want 3", h.count())
+	}
+	if got := committed(t, brokers, "core"); got != 0 {
+		t.Fatalf("committed %d while standing before the offset commit, want 0", got)
+	}
+	close(release)
+	waitFor(t, "the commit after the seam", func() bool { return committed(t, brokers, "core") == 3 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+// Found on review of #12 by @MustafaKemalV. A SIGTERM that lands while the
+// handlers are inside a batch cancels the context the commit was about to use,
+// so every handler finishes, answers Done, and the commit fails on
+// "context canceled": nothing lost, but a whole batch redelivered and a non
+// zero exit on every rolling restart that lands mid batch. 0002 says the
+// offset commit failing while the process is alive is not a failure of the
+// message. The commit has to outlive the cancellation.
+func TestCancelInsideABatchStillCommitsWhatWasEarned(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 3)
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h := handlerFunc(func(context.Context, decoded) (pipeline.Outcome, error) {
+		once.Do(func() { close(inside) })
+		<-release
+		return pipeline.Done, nil
+	})
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	<-inside
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on a cancel that landed inside a batch, want nil", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	c.Close()
+	if got := committed(t, brokers, "core"); got != 3 {
+		t.Fatalf("committed %d after a cancel inside the batch, want 3: the handlers had finished", got)
+	}
+}
+
+// Found on the same review. AllowRebalance was called on three explicit paths
+// and none of them is a defer, so a panic in the decoder, the handler, the
+// Sink or the hook unwinds past all three and Close blocks forever: the
+// process that should have crashed hangs instead. The panic still propagates;
+// what this asserts is that Close returns after it.
+func TestAPanicInTheLoopDoesNotWedgeClose(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 1)
+	hook := func(context.Context, []*kgo.Record) error { panic("a bug in the hook") }
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, &answer{}, WithCommitHook[decoded](hook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		_ = c.Run(context.Background())
+	}()
+	select {
+	case r := <-recovered:
+		if r == nil {
+			t.Fatal("the panic did not propagate out of Run")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run neither returned nor panicked")
+	}
+	closed := make(chan struct{})
+	go func() { c.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return within 10s after a panic in the loop")
+	}
+}
+
+type handlerFunc func(context.Context, decoded) (pipeline.Outcome, error)
+
+func (f handlerFunc) Handle(ctx context.Context, m decoded) (pipeline.Outcome, error) {
+	return f(ctx, m)
+}
