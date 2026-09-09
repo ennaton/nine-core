@@ -8,6 +8,11 @@ the implementation cannot choose freely, measured against a table built to the
 The short version: detach concurrently, and make the retry `FINALIZE` rather than
 another detach.
 
+The scratch table is called `ev` throughout, partitioned by range on `at`, which
+is `events` partitioned on `occurred_at` with shorter names. The blocks below
+carry the values that came back, reformatted to read; the error strings are
+verbatim and the rest is not a terminal capture.
+
 ## A plain detach stops ingest for as long as it runs
 
 `ALTER TABLE ... DETACH PARTITION` takes `AccessExclusiveLock` on the parent and
@@ -79,7 +84,7 @@ SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
   FROM pg_class c
   JOIN pg_inherits i ON i.inhrelid = c.oid
   JOIN pg_class p ON p.oid = i.inhparent
- WHERE p.relname = 'events';
+ WHERE p.relname = 'ev';
 ```
 
 ```
