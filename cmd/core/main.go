@@ -1,17 +1,16 @@
-// Command core joins the events consumer group and reads.
+// Command core joins the events consumer group and writes what it reads.
 //
-// Today the handler answers Done for every record after logging its id, which
-// is exactly enough to show two instances splitting the topic (CO2.1) and
-// nothing more. The database write is CO2.2 and replaces the handler; the
-// retry, parked and dead letter producers are CO4 and add a Sink. Until then a
-// Retry or Poison outcome stops the process rather than losing the record,
-// and this handler never answers either.
+// The handler is the idempotent insert of CO2.2, in its own transaction, and
+// the offset is committed after it returns: nine-docs/adr/0002. The retry,
+// parked and dead letter producers are CO4 and add a Sink; until then a Retry
+// or Poison outcome stops the process rather than losing the record.
+//
+// The schema is applied by cmd/migrate, as the owner. This binary connects
+// as nine_app and can only insert and read.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,35 +19,12 @@ import (
 	"syscall"
 
 	"github.com/ennaton/nine-core/internal/consumer"
-	"github.com/ennaton/nine-core/internal/pipeline"
+	"github.com/ennaton/nine-core/internal/event"
+	"github.com/ennaton/nine-core/internal/store"
 )
 
-// envelope is the little of agent_run.v1 the log handler needs. The full type,
-// mirrored from the contract and checked against it the way ingest does,
-// arrives with CO2.2.
-type envelope struct {
-	Tenant  string
-	EventID string `json:"event_id"`
-}
-
-func decode(key, value []byte) (envelope, error) {
-	var e envelope
-	if err := json.Unmarshal(value, &e); err != nil {
-		return e, err
-	}
-	if e.EventID == "" {
-		return e, errors.New("event_id missing")
-	}
-	e.Tenant = string(key)
-	return e, nil
-}
-
-type logHandler struct{ log *slog.Logger }
-
-func (h logHandler) Handle(_ context.Context, e envelope) (pipeline.Outcome, error) {
-	h.log.Info("event", "tenant", e.Tenant, "event_id", e.EventID)
-	return pipeline.Done, nil
-}
+// envelope is the consumer's message type: the decoded event.
+type envelope = event.AgentRun
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -65,14 +41,21 @@ func run(log *slog.Logger) error {
 		Topic:   env("NINE_TOPIC", "events"),
 		Log:     log,
 	}
-	c, err := consumer.New(cfg, decode, logHandler{log: log}, faultOptions()...)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	db, err := store.Open(ctx, env("NINE_CORE_DSN", "postgres://nine_app:nine_app_dev@localhost:15432/nine_core")) // nine:allow-secret, the compose dev stack
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	c, err := consumer.New(cfg, event.Decode, store.Handler{Store: db, Log: log}, faultOptions()...)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	log.Info("core joining", "brokers", cfg.Brokers, "group", cfg.Group, "topic", cfg.Topic, "fault_injection", faultInjection)
 	if err := c.Run(ctx); err != nil {
 		return fmt.Errorf("run: %w", err)

@@ -507,3 +507,35 @@ type handlerFunc func(context.Context, decoded) (pipeline.Outcome, error)
 func (f handlerFunc) Handle(ctx context.Context, m decoded) (pipeline.Outcome, error) {
 	return f(ctx, m)
 }
+
+// A shutdown that lands while the handler is inside its transaction makes
+// the handler fail on a cancelled context, and that failure is the
+// shutdown's, not the record's. Found on the self review of CO2.2: the
+// store's insert on a cancelled context classified as Fatal and Run
+// returned an error on every restart that landed inside a handler.
+func TestCancelInsideAHandlerIsAShutdownNotAFatal(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	var n int
+	h := handlerFunc(func(ctx context.Context, m decoded) (pipeline.Outcome, error) {
+		n++
+		if n == 2 {
+			cancel()
+			<-ctx.Done()
+			return pipeline.Fatal, ctx.Err() // what a store answers on a cancelled context
+		}
+		return pipeline.Done, nil
+	})
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Run(ctx); err != nil {
+		t.Fatalf("Run returned %v on a cancel inside a handler, want nil", err)
+	}
+	c.Close()
+	if got := committed(t, brokers, "core"); got != 1 {
+		t.Fatalf("committed %d, want 1: the record before the cancel was earned, the cancelled one was not", got)
+	}
+}

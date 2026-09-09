@@ -9,6 +9,21 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The store's tests measure PostgreSQL rather than a fake of it, so the
+    # job carries one. The tests create and drop their own database in it.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      NINE_TEST_MIGRATE_DSN: postgres://postgres:postgres@localhost:5432/postgres  # nine:allow-secret, the job's own throwaway service
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nine.dev/contracts/events/agent_run.v1.json",
+  "title": "agent_run.v1",
+  "description": "One completed run of an AI coding agent. This schema is the privacy boundary: it accepts counts, durations, hashes and enums, and it has no field anywhere that can carry a file path, a prompt fragment, a repository name or a secret. additionalProperties is false, so a field the schema does not know is rejected at the edge rather than stored and flagged.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "agent", "occurred_at", "duration_ms", "outcome"],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "Client-generated idempotency key. The same run reported twice carries the same id and is stored once.",
+      "pattern": "^[A-Za-z0-9_-]{8,64}$"
+    },
+    "agent": {
+      "type": "string",
+      "description": "Which tool produced the run. An enum, not free text: a new agent needs a schema version, not a surprise value in the data.",
+      "enum": ["claude-code", "cursor", "codex", "copilot", "aider", "other"]
+    },
+    "agent_version": {
+      "type": "string",
+      "description": "Version string of the agent itself.",
+      "pattern": "^[0-9A-Za-z.+-]{1,32}$"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Hashed on the client. Groups runs that belong to one working session without identifying it.",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "repo_hash": {
+      "type": "string",
+      "description": "SHA-256 of the repository identity, computed on the device. The name never leaves the machine, so two runs can be grouped by repository without the server knowing which repository it is.",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the run finished, RFC 3339. The server records its own arrival time separately; a clock-skewed client cannot rewrite history."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "description": "Wall clock duration of the run.",
+      "minimum": 0,
+      "maximum": 86400000
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["success", "error", "cancelled", "timeout"]
+    },
+    "error_kind": {
+      "type": "string",
+      "description": "Why it failed, as a closed set. Deliberately not a message: an error message is exactly the field most likely to carry a path or a key.",
+      "enum": ["rate_limit", "context_limit", "tool_failure", "network", "auth", "user_abort", "unknown"]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier as reported by the agent.",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "tokens_in": { "type": "integer", "minimum": 0 },
+    "tokens_out": { "type": "integer", "minimum": 0 },
+    "cost_micros": {
+      "type": "integer",
+      "description": "Cost in millionths of a currency unit. An integer for the same reason the ledger uses minor units: money in a floating type does not add up.",
+      "minimum": 0
+    },
+    "files_touched": {
+      "type": "integer",
+      "description": "How many files the run changed. A count, never the names.",
+      "minimum": 0
+    },
+    "lines_added":   { "type": "integer", "minimum": 0 },
+    "lines_removed": { "type": "integer", "minimum": 0 },
+    "tool_calls":    { "type": "integer", "minimum": 0 }
+  }
+}
