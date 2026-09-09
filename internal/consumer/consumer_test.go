@@ -424,3 +424,86 @@ func TestTheSeamTellsTheTestWhereItStands(t *testing.T) {
 	}
 	c.Close()
 }
+
+// Found on review of #12 by @MustafaKemalV. A SIGTERM that lands while the
+// handlers are inside a batch cancels the context the commit was about to use,
+// so every handler finishes, answers Done, and the commit fails on
+// "context canceled": nothing lost, but a whole batch redelivered and a non
+// zero exit on every rolling restart that lands mid batch. 0002 says the
+// offset commit failing while the process is alive is not a failure of the
+// message. The commit has to outlive the cancellation.
+func TestCancelInsideABatchStillCommitsWhatWasEarned(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 3)
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h := handlerFunc(func(context.Context, decoded) (pipeline.Outcome, error) {
+		once.Do(func() { close(inside) })
+		<-release
+		return pipeline.Done, nil
+	})
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	<-inside
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on a cancel that landed inside a batch, want nil", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	c.Close()
+	if got := committed(t, brokers, "core"); got != 3 {
+		t.Fatalf("committed %d after a cancel inside the batch, want 3: the handlers had finished", got)
+	}
+}
+
+// Found on the same review. AllowRebalance was called on three explicit paths
+// and none of them is a defer, so a panic in the decoder, the handler, the
+// Sink or the hook unwinds past all three and Close blocks forever: the
+// process that should have crashed hangs instead. The panic still propagates;
+// what this asserts is that Close returns after it.
+func TestAPanicInTheLoopDoesNotWedgeClose(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 1)
+	hook := func(context.Context, []*kgo.Record) error { panic("a bug in the hook") }
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, &answer{}, WithCommitHook[decoded](hook))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		_ = c.Run(context.Background())
+	}()
+	select {
+	case r := <-recovered:
+		if r == nil {
+			t.Fatal("the panic did not propagate out of Run")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run neither returned nor panicked")
+	}
+	closed := make(chan struct{})
+	go func() { c.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return within 10s after a panic in the loop")
+	}
+}
+
+type handlerFunc func(context.Context, decoded) (pipeline.Outcome, error)
+
+func (f handlerFunc) Handle(ctx context.Context, m decoded) (pipeline.Outcome, error) {
+	return f(ctx, m)
+}

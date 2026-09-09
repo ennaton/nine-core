@@ -23,6 +23,17 @@ jobs:
         run: go test -race -coverprofile=coverage.out ./...
       - name: Build
         run: go build ./...
+      # The crash tests stand on a fault point that exists only behind the
+      # faultinject build tag. This turns the measurement in
+      # docs/artifacts/2026-09-08-the-seam-the-crash-tests-need.md into a
+      # standing guarantee: the shipped binary does not contain the name of
+      # the variable that would fire it, and the tagged one does.
+      - name: The shipped binary carries no fault point
+        run: |
+          go build -o /tmp/core ./cmd/core
+          if grep -q NINE_FAULT /tmp/core; then echo "NINE_FAULT is in the shipped binary"; exit 1; fi
+          go build -tags faultinject -o /tmp/core-fault ./cmd/core
+          grep -q NINE_FAULT /tmp/core-fault
 
   scan:
     runs-on: ubuntu-latest

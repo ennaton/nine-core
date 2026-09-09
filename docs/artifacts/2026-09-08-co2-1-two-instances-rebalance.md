@@ -14,9 +14,9 @@ sleep 12; twelve events produced with kafka-console-producer, keys tenant-0..3
 sleep 6; SIGTERM B; sleep 8; SIGTERM A
 ```
 
-The group was new, so A first read the twenty four events earlier runs had
-left on the topic. Those lines are dropped below; the twelve produced in this
-run carry the prefix `run3-`.
+The group was new, so A first read the twelve events an earlier run had left
+on the topic. Those lines are dropped below; the twelve produced in this run
+carry the prefix `run3-`.
 
 ## Instance A
 
@@ -52,8 +52,15 @@ run carry the prefix `run3-`.
 | 4 | 6 | 6 | 0 |
 
 Partitions 2 and 5 held no messages: four tenant keys hash to four
-partitions. Automatic commit is off in the client, so every committed offset
-above was written by `CommitRecords` after the handler answered `Done`.
+partitions. The offsets sum to 26 and the records to 24, twelve from the
+earlier run and twelve from this one, read back from the start with a plain
+client and counted by id prefix: partition 3's log starts at offset 2, its
+first segment is `00000000000000000002.log`, and the two offsets before it
+were deleted by retention, the topic having been created on 18 August. Which
+is also why the first version of this file said "twenty four earlier events":
+that number was arithmetic, not a measurement, and @MustafaKemalV caught it on
+review. Automatic commit is off in the client, so every committed offset above
+was written by `CommitRecords` after the consumer accounted for the record.
 
 ## What this shows, and what it does not
 

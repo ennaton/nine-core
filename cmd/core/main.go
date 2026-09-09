@@ -65,7 +65,7 @@ func run(log *slog.Logger) error {
 		Topic:   env("NINE_TOPIC", "events"),
 		Log:     log,
 	}
-	c, err := consumer.New(cfg, decode, logHandler{log: log})
+	c, err := consumer.New(cfg, decode, logHandler{log: log}, faultOptions()...)
 	if err != nil {
 		return err
 	}
@@ -73,7 +73,7 @@ func run(log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Info("core joining", "brokers", cfg.Brokers, "group", cfg.Group, "topic", cfg.Topic)
+	log.Info("core joining", "brokers", cfg.Brokers, "group", cfg.Group, "topic", cfg.Topic, "fault_injection", faultInjection)
 	if err := c.Run(ctx); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}

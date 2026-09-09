@@ -1,6 +1,8 @@
 // Package consumer reads a topic as a member of a consumer group and hands
 // every record to a pipeline.Handler, committing offsets by hand and only for
-// the records the handler answered Done.
+// the records it has accounted for: a Done from the handler, or a Retry or
+// Poison the Sink has acknowledged. A record it cannot account for stops the
+// consumer with that record and everything after it uncommitted.
 //
 // The order is fixed by nine-docs/adr/0002: whatever the handler does with a
 // message, its transaction commits first, and the offset for that message is
@@ -59,6 +61,10 @@ type Config struct {
 	MaxPoll int           // records per poll, default 100; bounds how long a rebalance waits
 	Log     *slog.Logger  // default slog.Default()
 	Session time.Duration // default 10s; kept small so a test sees a rebalance in seconds
+	// CommitTimeout bounds the offset commit, which runs on a context that
+	// outlives the caller's: a shutdown that lands inside a batch must not
+	// turn earned offsets into a failed commit. Default 10s.
+	CommitTimeout time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -73,6 +79,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Session <= 0 {
 		c.Session = 10 * time.Second
+	}
+	if c.CommitTimeout <= 0 {
+		c.CommitTimeout = 10 * time.Second
 	}
 	return c
 }
@@ -153,36 +162,53 @@ func (c *Consumer[T]) Close() { c.cl.Close() }
 // as opposed to the context ending.
 var ErrStopped = errors.New("consumer stopped")
 
-// Run polls until ctx ends, and returns nil then. It returns an error wrapping
-// ErrStopped when a record makes it refuse to continue: a Fatal or Unknown
-// outcome, a Retry or Poison with no Sink, a Sink or hook that failed, or an
-// offset commit that failed. In every one of those the offsets of that batch
-// stay where they were, so the records come back.
+// Run polls until ctx ends, and returns nil then, after committing whatever
+// the batch in flight had earned: a cancellation that lands while handlers
+// are running is a shutdown, not a failure of the records they finished. It
+// returns an error wrapping ErrStopped when a record makes it refuse to
+// continue: a Fatal or Unknown outcome, a Retry or Poison with no Sink, a Sink
+// or hook that failed, or an offset commit that failed. In every one of those
+// the offsets from that record on stay where they were, so the records come
+// back.
 //
 // One batch, in order: every record on every fetched partition goes through
-// decode and the handler; the Done ones are collected. Then the hook, then one
-// synchronous commit of the collected records, then the rebalance is allowed.
-// Time O(n) in records per batch, memory O(n) for the acknowledgements.
+// decode and the handler; the accounted ones are collected. Then the hook,
+// then one synchronous commit of the collected records, then the rebalance is
+// allowed. Time O(n) in records per batch, memory O(n) for the
+// acknowledgements.
 func (c *Consumer[T]) Run(ctx context.Context) error {
 	for {
 		fetches := c.cl.PollRecords(ctx, c.cfg.MaxPoll)
-		if fetches.IsClientClosed() || ctx.Err() != nil {
-			// Every PollRecords blocks the next rebalance until this call,
-			// and Close waits for it: leaving without it hangs the caller.
-			// Whatever the poll returned stays uncommitted and comes back.
-			c.cl.AllowRebalance()
-			return nil
-		}
-		acked, stop := c.process(ctx, fetches)
-		if err := c.commit(ctx, acked); err != nil {
-			c.cl.AllowRebalance()
+		if done, err := c.batch(ctx, fetches); done {
 			return err
 		}
-		c.cl.AllowRebalance()
-		if stop != nil {
-			return stop
-		}
 	}
+}
+
+// batch is one poll's worth of work, in its own function so that the one
+// thing every path must do is a defer rather than a call on each path: every
+// PollRecords blocks the next rebalance until AllowRebalance, and Close waits
+// for it. Three explicit calls covered three paths and a panic in the decoder,
+// the handler, the Sink or the hook unwound past all of them, which turned a
+// process that should have crashed into one that hung in Close.
+func (c *Consumer[T]) batch(ctx context.Context, fetches kgo.Fetches) (done bool, err error) {
+	defer c.cl.AllowRebalance()
+	if fetches.IsClientClosed() {
+		return true, nil
+	}
+	acked, stop := c.process(ctx, fetches)
+	if err := c.commit(acked); err != nil {
+		return true, err
+	}
+	if stop != nil {
+		return true, stop
+	}
+	// Checked after the commit on purpose: a cancellation that arrived while
+	// the handlers were inside the batch has already been honoured by the
+	// handlers themselves. What they finished is committed above, and then
+	// the loop ends. Records the poll returned that were not reached stay
+	// uncommitted and come back to the next member.
+	return ctx.Err() != nil, nil
 }
 
 // process runs the handler over one batch and returns the records to commit,
@@ -237,10 +263,21 @@ func (c *Consumer[T]) one(ctx context.Context, r *kgo.Record) error {
 // partition in one synchronous request. Nothing is committed if the hook
 // refuses, and a commit that fails is a reason to stop rather than to carry
 // on: advancing past an uncommitted write is the one thing 0002 forbids.
-func (c *Consumer[T]) commit(ctx context.Context, acked []*kgo.Record) error {
+//
+// It runs on its own context, bounded by CommitTimeout, and not on the
+// caller's. The caller's context is cancelled by a shutdown, and a shutdown
+// that lands while handlers are inside the batch would otherwise cancel the
+// commit of work those handlers have finished: measured, three handlers
+// answered Done and zero offsets were committed. Nothing was lost, but every
+// rolling restart that landed mid batch redelivered a batch and exited non
+// zero, which 0002 names as the one commit failure that is not the
+// message's fault.
+func (c *Consumer[T]) commit(acked []*kgo.Record) error {
 	if len(acked) == 0 {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.CommitTimeout)
+	defer cancel()
 	if c.hook != nil {
 		if err := c.hook(ctx, acked); err != nil {
 			return fmt.Errorf("%w: commit hook refused: %v", ErrStopped, err)

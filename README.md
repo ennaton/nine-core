@@ -54,8 +54,16 @@ NINE_KAFKA_BROKERS=localhost:19092 go run ./cmd/core   # joins group "core" on t
 Two instances of `cmd/core` split the topic between them and the rebalance is
 visible in both logs; `docs/artifacts/2026-09-08-co2-1-two-instances-rebalance.md`
 is one such run against the compose broker. Offsets are committed by hand and
-only for records the handler answered `Done`; the order, database first and
+only for records the consumer has accounted for, a `Done` from the handler or a
+`Retry` or `Poison` the sink took; a record it cannot account for stops it with
+that record and everything after it uncommitted. The order, database first and
 offset second, is `nine-docs/adr/0002`.
+
+`go build -tags faultinject ./cmd/core` produces the binary the crash tests
+kill: `NINE_FAULT_AFTER_DB_COMMIT=exit` leaves with code 97 between the
+handlers and the offset commit, `=pause` prints `nine-fault-reached` and waits
+on stdin. The plain build does not contain the variable's name, and CI checks
+that on every push.
 
 ## Measurements
 
