@@ -217,6 +217,13 @@ func (c *Consumer[T]) batch(ctx context.Context, fetches kgo.Fetches) (done bool
 // are not committed, so the records are redelivered.
 func (c *Consumer[T]) process(ctx context.Context, fetches kgo.Fetches) (acked []*kgo.Record, stop error) {
 	fetches.EachError(func(t string, p int32, err error) {
+		// A cancelled poll reports itself as a fetch error on partition -1.
+		// That is the shutdown the caller asked for, not a broker problem,
+		// and a WARN on every clean stop is a line an operator learns to
+		// ignore, which is the wrong lesson to teach about this log.
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		c.cfg.Log.Warn("fetch error", "partition", p, "err", err)
 	})
 	iter := fetches.RecordIter()
