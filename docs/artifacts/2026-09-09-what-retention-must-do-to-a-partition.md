@@ -1,7 +1,7 @@
 # What retention must do to a partition, and the order it must do it in
 
-`CO3.3` drops old partitions of `events`. The table does not exist yet and no
-board row creates it, so this is not the implementation. It is the set of things
+`CO3.3` drops old partitions of `events`. The table exists as of `CO2.2`, `nine-core#15`, which was the gap this file first
+named as unowned, so this is the design rather than the implementation. It is the set of things
 the implementation cannot choose freely, measured against a table built to the
 `CO3.1` shape on PostgreSQL 16 rather than reasoned from the documentation.
 
@@ -23,17 +23,21 @@ ev      -> AccessExclusiveLock
 ev_w36  -> AccessExclusiveLock
 ```
 
-That lock conflicts with the ordinary insert path. With a detach open in one
-session, an insert in another dies rather than waits:
+That lock conflicts with the ordinary insert path. An insert issued while the
+detach is open blocks for as long as the detach runs, and dies only if its
+session carries a lock timeout. Both halves were measured, and the first
+statement of this artifact had them backwards: my `SET lock_timeout = '2s'` is
+what killed the insert, not the detach.
 
 ```
-SET lock_timeout = '2s';
-INSERT INTO ev VALUES (...);
-ERROR:  canceling statement due to lock timeout
+with lock_timeout = 2s     ERROR:  canceling statement due to lock timeout
+with no lock_timeout       waited 2.57 s for the detach, then succeeded
 ```
 
-So a retention job written the obvious way takes the write path down every time
-it runs, on a service whose whole job is to accept a continuous stream.
+The second line is @canakyuz's measurement, on the review of this file. The
+conclusion is the same either way and the mechanism is not: a retention job
+written the obvious way takes the write path down for its duration, on a service
+whose whole job is to accept a continuous stream.
 
 ## Concurrently does not block new writes, and waits for the old ones
 
@@ -123,12 +127,52 @@ is, which is a second reason for it to exist.
 Read the bounds, refuse an active partition, write the record with the row count,
 detach concurrently or finalize a pending detach, then drop the detached table.
 
-## What is not measured here
+## A default partition breaks all of this, so `events` must never have one
 
-Whether dropping the already detached table takes any lock on the parent. It
-should not, since the table is independent by then, and that is the reason for
-detaching first rather than dropping outright, but I did not measure it and it is
-not written here as though I had.
+Measured by @canakyuz on the review of this file, and it is the finding that
+decides whether the design works at all:
 
-And the table itself. `nine-core` holds no SQL and no migration tool, and no board
-row creates `events`. Until that has an owner, this is a design that cannot be run.
+```
+CREATE TABLE ev_default PARTITION OF ev DEFAULT;
+ALTER TABLE ev DETACH PARTITION ev_w36 CONCURRENTLY;
+ERROR:  cannot detach partitions concurrently when a default partition exists
+```
+
+A default partition is the first thing a careful person adds when `CO3.2` is late
+with next week's, and from that moment every retention run ends in that error. So
+the rule is that `events` carries no default partition, and the job checks for one
+before it starts and refuses loudly rather than discovering it in a log.
+
+The first migration is on the right side of this already: `CO2.2` creates twelve
+weekly partitions and no default, and an event outside the horizon raises `23514`,
+which `nine-docs/adr/0001` revision 3 maps to `Retry` rather than to a stopped
+consumer.
+
+## Dropping the detached table does not touch the parent
+
+The reason for detaching first rather than dropping outright, measured by
+@canakyuz rather than assumed here, which is how the first version of this file
+left it:
+
+```
+DROP TABLE on the detached table:  AccessExclusiveLock on the table, its toast
+                                   table and its index, and on nothing else
+insert on ev during the drop:      0.08 s
+```
+
+So the last step of the order costs the write path nothing.
+
+## The record carries the bounds exactly and the row count as an estimate
+
+`count(*)` on a partition about to be dropped is a full scan, and at the volumes
+`CO3.1` measured that is seven million rows a week at a million events a day,
+and seven hundred thousand at a hundred thousand. The record does not need it to be exact: what the replay tool reads is the
+boundary, and the boundary is the partition's range, which is exact and free.
+
+So the record carries the range as it comes from `relpartbound`, and the row count
+from `pg_class.reltuples`, written down as an estimate and named as one. On the
+scratch table `reltuples` after `ANALYZE` matched `count(*)` exactly, which is
+worth nothing as a guarantee: it is an estimate that is stale between analyzes,
+and a number that says how many rows were dropped is an audit line, not an
+invariant. If an exact count is ever wanted, it is a deliberate scan and not the
+default cost of every retention run.
