@@ -145,8 +145,32 @@ func TestAnEventOutsideThePartitionHorizonIsRetry(t *testing.T) {
 	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 		t.Fatalf("want 23514, got %v", err)
 	}
+	// The half of the distinction the database supplies: this 23514 names no
+	// constraint, which is what tells it apart from a check the table refuses.
+	if pgErr.ConstraintName != "" {
+		t.Fatalf("a routing failure named the constraint %q, so the split in Classify is wrong", pgErr.ConstraintName)
+	}
 	if got := Classify(err); got != pipeline.Retry {
 		t.Fatalf("23514 classified as %v, want Retry", got)
+	}
+}
+
+// The other 23514: a row the table's own check refuses. Written because the
+// two share a code and revision 3 is only true while they are told apart.
+func TestACheckTheTableRefusesIsFatal(t *testing.T) {
+	s := fresh(t)
+	e := sample("run-000006", inWeek)
+	e.RepoHash = []byte{1, 2, 3} // not 32 bytes: events_repo_hash_is_sha256
+	err := s.Insert(context.Background(), e)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("want 23514, got %v", err)
+	}
+	if pgErr.ConstraintName != "events_repo_hash_is_sha256" {
+		t.Fatalf("constraint name is %q, want events_repo_hash_is_sha256", pgErr.ConstraintName)
+	}
+	if got := Classify(err); got != pipeline.Fatal {
+		t.Fatalf("a named check violation classified as %v, want Fatal", got)
 	}
 }
 
@@ -176,7 +200,7 @@ func TestClassifyCodes(t *testing.T) {
 		"23505": pipeline.Done,  // the same event twice, through another unique index
 		"40001": pipeline.Retry, // revision 2
 		"57P01": pipeline.Retry, // admin shutdown
-		"23514": pipeline.Retry, // revision 3, no partition for the row
+		"23514": pipeline.Retry, // revision 3, no partition for the row: no constraint named
 		"08006": pipeline.Retry, // connection failure, the class
 		"42P01": pipeline.Fatal, // undefined table: the schema is wrong, every message would be
 		"22001": pipeline.Fatal, // a value too long: not in the table, the closing rule
@@ -186,6 +210,12 @@ func TestClassifyCodes(t *testing.T) {
 		if got := Classify(&pgconn.PgError{Code: code}); got != want {
 			t.Errorf("%s: %v, want %v", code, got, want)
 		}
+	}
+	// 23514 is two failures under one code, and only the constraint name
+	// separates them. Revision 3 drew the line in prose; this is the line in
+	// the code, so CO3 cannot add a check that quietly becomes a Retry.
+	if got := Classify(&pgconn.PgError{Code: "23514", ConstraintName: "events_repo_hash_is_sha256"}); got != pipeline.Fatal {
+		t.Errorf("a named check violation is %v, want Fatal", got)
 	}
 	if got := Classify(errors.New("something nobody mapped")); got != pipeline.Fatal {
 		t.Errorf("an unmapped error is %v, want Fatal", got)

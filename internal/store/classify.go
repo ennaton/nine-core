@@ -44,7 +44,7 @@ func Classify(err error) pipeline.Outcome {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return classifyCode(pgErr.Code)
+		return classifyPg(pgErr)
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) || pgconn.SafeToRetry(err) {
@@ -58,22 +58,39 @@ func Classify(err error) pipeline.Outcome {
 	return pipeline.Fatal
 }
 
-// classifyCode is the SQLSTATE half of the table. Class 08 is the connection
+// classifyPg is the SQLSTATE half of the table. Class 08 is the connection
 // exception class as a whole; the rest are the individual codes 0001 names,
 // and its revisions 2 and 3.
-func classifyCode(code string) pipeline.Outcome {
+func classifyPg(e *pgconn.PgError) pipeline.Outcome {
+	code := e.Code
 	switch {
 	case code == "23505":
 		// The same event, arriving twice, through a unique index the insert
 		// did not infer on. Already recorded.
 		return pipeline.Done
-	case code == "40001", code == "57P01", code == "23514":
+	case code == "40001", code == "57P01":
 		// 40001: two consumers raced above read committed (revision 2).
 		// 57P01: admin shutdown, the dependency going away.
-		// 23514 here is "no partition of relation events found for row":
-		// the partition for that week does not exist yet, which is a
-		// dependency CO3.2 supplies, not a fault in the message (revision 3).
 		return pipeline.Retry
+	case code == "23514":
+		// Two different failures share this code and they are not the same
+		// answer, which @MustafaKemalV named on the review of revision 3:
+		// the revision drew the line and the code did not, so it held only
+		// as long as this table had no other check. Measured on PostgreSQL
+		// 16, the two differ in what they report:
+		//
+		//   no partition of relation "ev" found for row   ConstraintName ""
+		//   violates check constraint "ev_h_is_sha256"    ConstraintName "ev_h_is_sha256"
+		//
+		// A row with nowhere to go is the partition CO3.2 has not created,
+		// a dependency, so Retry. A row a named constraint refuses is a row
+		// this schema will never take, so Fatal by the closing rule. The
+		// distinction is now the code's and not the prose's, and CO3 may add
+		// a check without silently turning it into a Retry.
+		if e.ConstraintName == "" {
+			return pipeline.Retry
+		}
+		return pipeline.Fatal
 	case len(code) >= 2 && code[:2] == "08":
 		return pipeline.Retry
 	}
