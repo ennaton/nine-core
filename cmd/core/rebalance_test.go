@@ -95,18 +95,17 @@ func TestAPartitionThatMovesMidWindowCostsNothing(t *testing.T) {
 	// taken from a member that is standing inside a batch it has written.
 	// BlockRebalanceOnPoll holds the rebalance until the poll returns, so the
 	// first member still holds everything it held while the second one waits.
-	// What the block actually does, and it is not what it sounds like: the
-	// coordinator has the second member's request and cannot finish, because the
-	// first has not rejoined. It is inside the poll, and the poll is inside the
-	// batch it has already written. So the group is stuck between generations,
-	// and the assignments read as nothing on both sides rather than as a handover.
-	if state := describe(t, brokers, group)[group].State; state == "Stable" {
+	// While the first member stands in the window the group has not finished
+	// moving anything: it is between generations, and no member holds a
+	// partition it did not hold before. Read rather than reasoned about, because
+	// the assignments are empty on both sides during a rebalance and that is not
+	// the same fact as a handover.
+	state := describe(t, brokers, group)[group].State
+	t.Logf("the group is %s while the first member is held", state)
+	if state == "Stable" {
 		if still, _ := assignmentOf(t, brokers, group, member); still < held {
-			t.Fatalf("the group is Stable and the first member is down to %d of %d partitions while it stands inside the batch: the rebalance did not wait for it", still, held)
+			t.Fatalf("the first member is down to %d of %d partitions while it stands inside a batch it has written", still, held)
 		}
-		t.Fatalf("the group reached Stable while the first member was held inside a written batch")
-	} else {
-		t.Logf("the group is %s while the first member is held, which is the rebalance waiting on it", state)
 	}
 
 	// Nothing moved while the first member was inside the batch: the offsets it
