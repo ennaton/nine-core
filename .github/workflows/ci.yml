@@ -22,8 +22,35 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # CO2.4 kills a process between the two commits and restarts it, so it
+      # needs the broker as well as the database. Without one the test cannot
+      # run, and a test that cannot run in CI is the fail open this workflow
+      # already refuses for the database.
+      kafka:
+        image: apache/kafka:3.9.0
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+          CLUSTER_ID: nine-ci-cluster-00000000
+        ports: ['19092:19092']
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
     env:
       NINE_TEST_MIGRATE_DSN: postgres://postgres:postgres@localhost:5432/postgres  # nine:allow-secret, the job's own throwaway service
+      NINE_KAFKA_BROKERS: localhost:19092
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
