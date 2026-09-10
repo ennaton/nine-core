@@ -33,7 +33,11 @@ func cluster(t *testing.T, partitions int32) []string {
 	return c.ListenAddrs()
 }
 
-func produce(t *testing.T, brokers []string, n int) {
+// produce returns the records it wrote, because the broker fills in each
+// one's timestamp and that timestamp is the only clock the delay gate reads.
+// A test that times the gate against its own time.Now measures a different
+// clock and fails on the few milliseconds between them.
+func produce(t *testing.T, brokers []string, n int) []*kgo.Record {
 	t.Helper()
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
@@ -47,6 +51,7 @@ func produce(t *testing.T, brokers []string, n int) {
 	if err := cl.ProduceSync(context.Background(), recs...).FirstErr(); err != nil {
 		t.Fatal(err)
 	}
+	return recs
 }
 
 // committed sums the group's committed offsets over every partition, which is
@@ -547,7 +552,7 @@ func TestCancelInsideAHandlerIsAShutdownNotAFatal(t *testing.T) {
 // which is the trade Kemal named on nine-billing#32 and it is the same one.
 func TestADelayTopicIsNotReadBeforeItsTime(t *testing.T) {
 	brokers := cluster(t, 1)
-	produce(t, brokers, 1)
+	recs := produce(t, brokers, 1)
 	const delay = 3 * time.Second
 
 	h := &answer{}
@@ -557,7 +562,14 @@ func TestADelayTopicIsNotReadBeforeItsTime(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	produced := time.Now()
+	// The record's own timestamp, not this test's clock. Measured on main,
+	// timing this from a time.Now taken after the produce failed one run in
+	// eight with "handled after 2.988823042s, which is less than the 3s
+	// delay": eleven milliseconds of skew between two clocks that are not the
+	// same clock. Found by @MustafaKemalV, who timed it from before the
+	// produce instead; this reads the clock the gate itself reads, so there
+	// is no skew left to be conservative about.
+	produced := recs[0].Timestamp
 	go func() { _ = c.Run(ctx) }()
 
 	// Not before its time. A second is a third of the delay: if the gate were
@@ -574,7 +586,7 @@ func TestADelayTopicIsNotReadBeforeItsTime(t *testing.T) {
 	waitFor(t, "the record after it ripens", func() bool { return h.count() == 1 })
 	waited := time.Since(produced)
 	if waited < delay {
-		t.Fatalf("handled after %s, which is less than the %s delay", waited, delay)
+		t.Fatalf("handled %s after the record's own timestamp, and the delay is %s", waited, delay)
 	}
 	waitFor(t, "the offset after the record", func() bool { return committed(t, brokers, "core") == 1 })
 	cancel()
