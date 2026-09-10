@@ -41,7 +41,7 @@ func TestACrashBetweenTheTwoCommitsLeavesNoDuplicate(t *testing.T) {
 	ctx := context.Background()
 
 	db, appDSN := scratchDatabase(t, owner)
-	topic, group := scratchTopic(t, brokers)
+	topic, group := scratchTopic(t, brokers, 1)
 	produce(t, brokers, topic, eventsInTest)
 
 	plain := build(t, false)
@@ -168,7 +168,7 @@ func dsnOf(cfg *pgx.ConnConfig) string {
 		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database)
 }
 
-func scratchTopic(t *testing.T, brokers []string) (string, string) {
+func scratchTopic(t *testing.T, brokers []string, partitions int32) (string, string) {
 	t.Helper()
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
@@ -177,7 +177,7 @@ func scratchTopic(t *testing.T, brokers []string) (string, string) {
 	defer cl.Close()
 	adm := kadm.NewClient(cl)
 	name := fmt.Sprintf("co24-%d", time.Now().UnixNano())
-	if _, err := adm.CreateTopic(context.Background(), 1, 1, nil, name); err != nil {
+	if _, err := adm.CreateTopic(context.Background(), partitions, 1, nil, name); err != nil {
 		t.Fatalf("create topic: %v", err)
 	}
 	t.Cleanup(func() { _, _ = adm.DeleteTopics(context.Background(), name) })
