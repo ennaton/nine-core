@@ -64,6 +64,13 @@ go run ./cmd/partition           # keeps four weeks ahead and two behind, idempo
 go run ./cmd/partition -list     # every partition and its bounds, creating nothing
 ```
 
+The same binary reads a delay topic: `NINE_TOPIC=events.retry-5m` with
+`NINE_CONSUMER_DELAY=5m` and its own group. A record is not handed to the
+handler until it has sat on that topic for the delay, measured from the
+record's own timestamp, and the wait is a pause and a seek rather than a
+sleep, so a rebalance does not queue behind it. See
+`docs/artifacts/2026-09-10-a-delay-topic-is-a-pause-not-a-sleep.md`.
+
 `cmd/partition` runs on a schedule, weekly or nightly, and creates nothing
 when the horizon is already there. It never creates a partition because an
 event asked for one: the horizon follows the clock, not the data, and
