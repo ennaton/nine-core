@@ -37,7 +37,7 @@ func TestTheRoundRisesByOnePerHop(t *testing.T) {
 	r := &kgo.Record{Topic: "events", Value: []byte(`{}`)}
 	topics := []string{"events.retry-5m", "events.retry-1h"}
 	for i, next := range topics {
-		m, err := Next(r, "run-1", "08006", "", at.Add(time.Duration(i)*time.Hour))
+		m, err := Retry(r, "run-1", "08006", at.Add(time.Duration(i)*time.Hour))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,16 +65,21 @@ func TestTheRoundRisesByOnePerHop(t *testing.T) {
 // on the way.
 func TestTheFirstFailureSurvivesEveryHop(t *testing.T) {
 	r := &kgo.Record{Topic: "events"}
-	first, err := Next(r, "run-1", "08006", "", at)
+	first, err := Retry(r, "run-1", "08006", at)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first.Apply(r)
 	r.Topic = "events.retry-5m"
 
-	later, err := Next(r, "run-1", "08006", OutcomeRetryExhausted, at.Add(65*time.Minute))
+	later, err := Park(r, "run-1", "08006", at.Add(65*time.Minute))
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Parking does not spend a tier: the record reached round one and stops
+	// there. Saying two would describe a wait that never happened.
+	if later.Round != 1 {
+		t.Fatalf("parking a round one record left it at %d, want 1", later.Round)
 	}
 	if !later.FirstFailedAt.Equal(at) {
 		t.Fatalf("first failure moved to %s, want %s", later.FirstFailedAt, at)
@@ -109,7 +114,7 @@ func TestApplyReplacesRatherThanAppends(t *testing.T) {
 		{Key: HeaderRound, Value: []byte("1")},
 		{Key: HeaderParkedAt, Value: []byte("2026-01-01T00:00:00Z")},
 	}}
-	m, err := Next(r, "run-1", "23514", "", at)
+	m, err := Retry(r, "run-1", "23514", at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +145,7 @@ func TestApplyReplacesRatherThanAppends(t *testing.T) {
 // with a driver message and nothing else is exactly who this refuses.
 func TestNoHeaderCarriesDriverText(t *testing.T) {
 	r := &kgo.Record{Topic: "events"}
-	m, err := Next(r, "run-1", "", OutcomePoison, at)
+	m, err := Poison(r, "run-1", "", at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,12 +157,12 @@ func TestNoHeaderCarriesDriverText(t *testing.T) {
 		if bad == "" {
 			continue
 		}
-		if _, err := Next(r, "run-1", bad, OutcomePoison, at); !errors.Is(err, ErrInvalidFailureCode) {
+		if _, err := Poison(r, "run-1", bad, at); !errors.Is(err, ErrInvalidFailureCode) {
 			t.Errorf("code %.40q gave %v, want ErrInvalidFailureCode", bad, err)
 		}
 	}
 	for _, good := range []string{"23514", "40001", "08006", "XX000", "timeout", "unreachable", "decode", "schema", CodeUnknown} {
-		if _, err := Next(r, "run-1", good, OutcomePoison, at); err != nil {
+		if _, err := Poison(r, "run-1", good, at); err != nil {
 			t.Errorf("code %q was refused: %v", good, err)
 		}
 	}
@@ -203,7 +208,7 @@ func TestTheMarksSurviveTheBroker(t *testing.T) {
 	defer cl.Close()
 
 	src := &kgo.Record{Topic: "events"}
-	m, err := Next(src, "run-42", "40001", OutcomeRetryExhausted, at)
+	m, err := Park(src, "run-42", "40001", at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +227,7 @@ func TestTheMarksSurviveTheBroker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back.EventID != "run-42" || back.Round != 1 || back.Outcome != OutcomeRetryExhausted ||
+	if back.EventID != "run-42" || back.Round != 0 || back.Outcome != OutcomeRetryExhausted ||
 		back.FailureCode != "40001" || back.SourceTopic != "events" ||
 		!back.FirstFailedAt.Equal(at) || !back.ParkedAt.Equal(at) {
 		t.Fatalf("came back as %+v", back)

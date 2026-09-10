@@ -17,6 +17,7 @@ import (
 
 	"github.com/ennaton/nine-core/internal/event"
 	"github.com/ennaton/nine-core/internal/pipeline"
+	"github.com/ennaton/nine-core/internal/retry"
 )
 
 // These run against a real PostgreSQL, the compose one locally and a service
@@ -242,6 +243,40 @@ func TestHandlerAnswersDoneForBothARowAndADuplicate(t *testing.T) {
 		o, err := h.Handle(context.Background(), sample("run-000005", inWeek))
 		if o != pipeline.Done || err != nil {
 			t.Fatalf("pass %d: %v %v", i, o, err)
+		}
+	}
+}
+
+// The header a parked record carries and the outcome the pipeline chose are
+// two readings of one error, so they are taken from one function. This pins
+// the pairs: a Retry that names a code the vocabulary does not hold would be
+// refused by the forwarder and stop the consumer.
+func TestTheFailureCodeAndTheOutcomeAgree(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		outcome pipeline.Outcome
+		code    string
+	}{
+		{"no partition for the row", &pgconn.PgError{Code: "23514"}, pipeline.Retry, "23514"},
+		{"a named check", &pgconn.PgError{Code: "23514", ConstraintName: "events_repo_hash_is_sha256"}, pipeline.Fatal, "23514"},
+		{"a serialization failure", &pgconn.PgError{Code: "40001"}, pipeline.Retry, "40001"},
+		{"the connection class", &pgconn.PgError{Code: "08006"}, pipeline.Retry, "08006"},
+		{"a timeout", context.DeadlineExceeded, pipeline.Retry, "timeout"},
+		{"an unknown enum value", fmt.Errorf("decode agent: %w", event.ErrUnknownValue), pipeline.Fatal, "schema"},
+		{"a payload that will not parse", errors.New("decode: unexpected end of JSON input"), pipeline.Fatal, "decode"},
+		{"something nobody mapped", errors.New("a new kind of trouble"), pipeline.Fatal, retry.CodeUnknown},
+	}
+	for _, c := range cases {
+		if got := Classify(c.err); got != c.outcome {
+			t.Errorf("%s: outcome %v, want %v", c.name, got, c.outcome)
+		}
+		code := FailureCode(c.err)
+		if code != c.code {
+			t.Errorf("%s: code %q, want %q", c.name, code, c.code)
+		}
+		if !retry.ValidCode(code) {
+			t.Errorf("%s: %q is outside adr/0003's vocabulary, so the forwarder would refuse it", c.name, code)
 		}
 	}
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/ennaton/nine-core/internal/consumer"
 	"github.com/ennaton/nine-core/internal/event"
+	"github.com/ennaton/nine-core/internal/retry"
 	"github.com/ennaton/nine-core/internal/store"
 )
 
@@ -64,7 +65,19 @@ func run(log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	c, err := consumer.New(cfg, event.Decode, store.Handler{Store: db, Log: log}, faultOptions()...)
+	// CO4.4. Without a sink a Retry or Poison stops the consumer rather than
+	// losing the record, which was CO2.1's refusal; with one it goes where
+	// nine-docs/adr/0001 says. The forwarder names the failure through the
+	// store's own classification, so the code in the header and the outcome
+	// in the pipeline come from one place.
+	fwd, err := retry.NewForwarder(cfg.Brokers, log, store.FailureCode)
+	if err != nil {
+		return err
+	}
+	defer fwd.Close()
+
+	opts := append([]consumer.Option[envelope]{consumer.WithSink[envelope](fwd)}, faultOptions()...)
+	c, err := consumer.New(cfg, event.Decode, store.Handler{Store: db, Log: log}, opts...)
 	if err != nil {
 		return err
 	}

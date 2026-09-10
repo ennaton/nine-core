@@ -353,7 +353,7 @@ func TestARecordThatDoesNotDecodeIsPoison(t *testing.T) {
 	}
 	cl.Close()
 	forwarded := make(chan pipeline.Outcome, 1)
-	sink := sinkFunc(func(_ context.Context, _ *kgo.Record, o pipeline.Outcome) error { forwarded <- o; return nil })
+	sink := sinkFunc(func(_ context.Context, _ *kgo.Record, o pipeline.Outcome, _ error) error { forwarded <- o; return nil })
 	h := &answer{}
 	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h, WithSink[decoded](sink))
 	if err != nil {
@@ -377,10 +377,10 @@ func TestARecordThatDoesNotDecodeIsPoison(t *testing.T) {
 	}
 }
 
-type sinkFunc func(context.Context, *kgo.Record, pipeline.Outcome) error
+type sinkFunc func(context.Context, *kgo.Record, pipeline.Outcome, error) error
 
-func (f sinkFunc) Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome) error {
-	return f(ctx, r, o)
+func (f sinkFunc) Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome, cause error) error {
+	return f(ctx, r, o, cause)
 }
 
 // What CO2.4 needs from the seam, in @MustafaKemalV's words on 0002: it is

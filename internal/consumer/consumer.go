@@ -43,7 +43,9 @@ type Decoder[T any] func(key, value []byte) (T, error)
 // because the source offset is committed right after it returns and a message
 // that was neither written nor forwarded is a message that was lost.
 type Sink interface {
-	Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome) error
+	// cause is the error that produced the outcome, so the sink can name the
+	// failure in a header. It is nil when nothing failed but the decode.
+	Forward(ctx context.Context, r *kgo.Record, o pipeline.Outcome, cause error) error
 }
 
 // CommitHook runs after the handler has returned for every record in a batch
@@ -389,8 +391,8 @@ func (c *Consumer[T]) one(ctx context.Context, r *kgo.Record) error {
 		if c.sink == nil {
 			return fmt.Errorf("%w: %v with no sink to forward to, partition %d offset %d", ErrStopped, outcome, r.Partition, r.Offset)
 		}
-		log.Info("forwarding", "outcome", outcome, "err", err)
-		if ferr := c.sink.Forward(ctx, r, outcome); ferr != nil {
+		log.Info("forwarding", "outcome", outcome.String(), "err", err)
+		if ferr := c.sink.Forward(ctx, r, outcome, err); ferr != nil {
 			return fmt.Errorf("%w: forward failed, partition %d offset %d: %v", ErrStopped, r.Partition, r.Offset, ferr)
 		}
 		return nil

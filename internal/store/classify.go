@@ -5,11 +5,14 @@ import (
 	"errors"
 	"io/fs"
 	"net"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/ennaton/nine-core/internal/event"
 	"github.com/ennaton/nine-core/internal/pipeline"
+	"github.com/ennaton/nine-core/internal/retry"
 )
 
 func errNoRows() error { return pgx.ErrNoRows }
@@ -95,4 +98,43 @@ func classifyPg(e *pgconn.PgError) pipeline.Outcome {
 		return pipeline.Retry
 	}
 	return pipeline.Fatal
+}
+
+// FailureCode names a failure in the closed vocabulary of nine-docs/adr/0003,
+// so the header a parked record carries and the outcome the pipeline chose
+// are decided by the same reading of the same error.
+//
+// It never returns the error's text. That is decision 2 of 0003, and the
+// forwarder refuses a value outside the vocabulary rather than trusting this
+// to be careful.
+func FailureCode(err error) string {
+	switch {
+	case err == nil:
+		return retry.CodeUnknown
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	case errors.Is(err, event.ErrUnknownValue):
+		return "schema"
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return pgErr.Code
+	}
+	var netErr net.Error
+	var connErr *pgconn.ConnectError
+	if errors.As(err, &netErr) || errors.As(err, &connErr) || pgconn.SafeToRetry(err) {
+		return "unreachable"
+	}
+	// A record that never decoded is the other half of Poison, and it comes
+	// from the decoder rather than from the database.
+	if isDecodeFailure(err) {
+		return "decode"
+	}
+	return retry.CodeUnknown
+}
+
+// isDecodeFailure is a shape rather than a type, because the decoder wraps
+// encoding/json's errors and those are several types with nothing in common.
+func isDecodeFailure(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "decode")
 }
