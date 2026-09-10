@@ -53,10 +53,22 @@ go run ./cmd/migrate                      # applies the events schema to nine_co
 NINE_KAFKA_BROKERS=localhost:19092 go run ./cmd/core   # joins group "core" on topic "events", writes as nine_app
 ```
 
-`cmd/migrate` reads `NINE_CORE_MIGRATE_DSN` and `cmd/core` reads
-`NINE_CORE_DSN`; both default to the compose stack. They are two binaries on
-purpose: the consumer connects as `nine_app`, which owns nothing and can only
-insert and read, so it never holds the owner's password.
+`cmd/migrate` and `cmd/partition` read `NINE_CORE_MIGRATE_DSN` and `cmd/core`
+reads `NINE_CORE_DSN`; all default to the compose stack. They are separate
+binaries on purpose: the consumer connects as `nine_app`, which owns nothing
+and can only insert and read, so it never holds the owner's password, and
+creating a partition is DDL.
+
+```bash
+go run ./cmd/partition           # keeps four weeks ahead and two behind, idempotent
+go run ./cmd/partition -list     # every partition and its bounds, creating nothing
+```
+
+`cmd/partition` runs on a schedule, weekly or nightly, and creates nothing
+when the horizon is already there. It never creates a partition because an
+event asked for one: the horizon follows the clock, not the data, and
+`docs/artifacts/2026-09-09-the-horizon-runs-ahead-of-the-clock.md` measures
+what the other way would cost.
 
 The `events` table is the shape measured in
 `docs/artifacts/2026-08-28-events-partition-interval.md`, weekly range
