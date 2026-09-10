@@ -52,12 +52,17 @@ const CodeUnknown = "unknown"
 // the first caller who has a message to hand and nothing else. So the rule is
 // here, and a value outside the vocabulary is refused rather than trimmed.
 var codeClasses = map[string]bool{
-	CodeUnknown:   true,
-	"timeout":     true, // the dependency did not answer in time
-	"unreachable": true, // connection refused, reset, no route
-	"decode":      true, // the payload is not agent_run.v1
-	"schema":      true, // a version this consumer does not know
+	CodeUnknown:         true,
+	CodeUnreadableRound: true, // the record could not say how far it had come
+	"timeout":           true, // the dependency did not answer in time
+	"unreachable":       true, // connection refused, reset, no route
+	"decode":            true, // the payload is not agent_run.v1
+	"schema":            true, // a version this consumer does not know
 }
+
+// CodeUnreadableRound is why a record was parked when the thing that stopped
+// it was its own nine-retry-round rather than a dependency.
+const CodeUnreadableRound = "unreadable-round"
 
 // sqlstate is five characters, digits and capitals, which is the whole of the
 // class: 23514, 40001, 08006, XX000.
@@ -174,15 +179,61 @@ func readTime(r *kgo.Record, key string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// Next is the marks a record carries on its way to the next topic: the round
-// spent, the failure that spent it, and the moment the trouble started.
+// Retry is the marks a record carries to the next delay tier: one more round
+// spent, and no verdict, because it has not reached one.
 //
 // FirstFailedAt is the record's own if it has one and now if it does not,
 // which is the whole reason it is a header. adr/0003 measured that a
 // forwarded record's timestamp is the moment it was forwarded, so after five
 // minutes and an hour the record's own clock is an hour out from the failure
 // it is about.
-func Next(r *kgo.Record, eventID, failureCode, outcome string, now time.Time) (Marks, error) {
+func Retry(r *kgo.Record, eventID, failureCode string, now time.Time) (Marks, error) {
+	return build(r, eventID, failureCode, "", true, now)
+}
+
+// Park is the marks a record carries to events.parked: every tier spent, and
+// the round it stops at is the round it reached.
+//
+// The round does not rise here, and that is the correction this replaced. A
+// record on events.retry-1h already carries the two rounds it spent, so
+// adding one on the way out would park it saying three, and 0003's table says
+// the value is how many rounds were spent.
+func Park(r *kgo.Record, eventID, failureCode string, now time.Time) (Marks, error) {
+	m, err := build(r, eventID, failureCode, OutcomeRetryExhausted, false, now)
+	if !errors.Is(err, ErrUnreadableRound) {
+		return m, err
+	}
+	// The record this refuses to read is the record parking exists for. Spent
+	// counts an unreadable round as spent and sends it here, and then Read
+	// refused it, so the rule was unimplementable until this: found by
+	// writing CO4.4 against CO4.3, one row after it merged.
+	//
+	// It is parked as fully spent, because that is the routing decision
+	// already taken, and the reason it stopped is named rather than blamed on
+	// whatever the handler last said. What is lost with the round is the rest
+	// of its marks, including the first failure: Read stops at the first
+	// unreadable header, so this record's history is what its body carries.
+	now = now.UTC().Truncate(time.Second)
+	return Marks{
+		EventID:       eventID,
+		Round:         Tiers(),
+		Outcome:       OutcomeRetryExhausted,
+		FailureCode:   CodeUnreadableRound,
+		SourceTopic:   r.Topic,
+		FirstFailedAt: now,
+		ParkedAt:      now,
+	}, nil
+}
+
+// Poison is the marks a record carries to events.dlq. The round does not rise
+// either: a payload that does not parse spent no tier on its way there, and a
+// dead letter record saying round one would be describing a wait that never
+// happened.
+func Poison(r *kgo.Record, eventID, failureCode string, now time.Time) (Marks, error) {
+	return build(r, eventID, failureCode, OutcomePoison, false, now)
+}
+
+func build(r *kgo.Record, eventID, failureCode, outcome string, spend bool, now time.Time) (Marks, error) {
 	prev, err := Read(r)
 	if err != nil {
 		return Marks{}, err
@@ -190,11 +241,14 @@ func Next(r *kgo.Record, eventID, failureCode, outcome string, now time.Time) (M
 	now = now.UTC().Truncate(time.Second)
 	m := Marks{
 		EventID:       eventID,
-		Round:         prev.Round + 1,
+		Round:         prev.Round,
 		Outcome:       outcome,
 		FailureCode:   failureCode,
 		SourceTopic:   r.Topic,
 		FirstFailedAt: prev.FirstFailedAt,
+	}
+	if spend {
+		m.Round++
 	}
 	if m.EventID == "" {
 		m.EventID = prev.EventID
@@ -211,22 +265,32 @@ func Next(r *kgo.Record, eventID, failureCode, outcome string, now time.Time) (M
 	if m.FirstFailedAt.IsZero() {
 		m.FirstFailedAt = now
 	}
-	if outcome == OutcomeRetryExhausted || outcome == OutcomePoison {
+	if outcome != "" {
 		m.ParkedAt = now
 	}
 	return m, nil
 }
 
-// Headers renders the marks in adr/0003's order. A zero time is left out
-// rather than written as a zero: a header that is present and meaningless is
-// worse than one that is absent, because only the second is obvious.
+// Headers renders the marks in adr/0003's order. An empty value is left out
+// rather than written as an empty header: a header that is present and
+// meaningless is worse than one that is absent, because only the second is
+// obvious. So a record still moving through the chain carries five marks and
+// a record that has stopped carries seven, and 0003 revision 1 says so.
+//
+// The empty nine-outcome was there until CO4.4 was written and a probe printed
+// it: 0003's vocabulary for that header is retry-exhausted or poison, and a
+// record on its way to another tier is neither.
 func (m Marks) Headers() []kgo.RecordHeader {
 	hs := []kgo.RecordHeader{
-		{Key: HeaderEventID, Value: []byte(m.EventID)},
 		{Key: HeaderRound, Value: []byte(strconv.Itoa(m.Round))},
-		{Key: HeaderOutcome, Value: []byte(m.Outcome)},
 		{Key: HeaderFailureCode, Value: []byte(m.FailureCode)},
 		{Key: HeaderSourceTopic, Value: []byte(m.SourceTopic)},
+	}
+	if m.EventID != "" {
+		hs = append([]kgo.RecordHeader{{Key: HeaderEventID, Value: []byte(m.EventID)}}, hs...)
+	}
+	if m.Outcome != "" {
+		hs = append(hs, kgo.RecordHeader{Key: HeaderOutcome, Value: []byte(m.Outcome)})
 	}
 	if !m.FirstFailedAt.IsZero() {
 		hs = append(hs, kgo.RecordHeader{Key: HeaderFirstFailedAt, Value: []byte(m.FirstFailedAt.UTC().Format(time.RFC3339))})
