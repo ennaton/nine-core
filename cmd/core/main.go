@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ennaton/nine-core/internal/consumer"
 	"github.com/ennaton/nine-core/internal/event"
@@ -41,6 +42,19 @@ func run(log *slog.Logger) error {
 		Topic:   env("NINE_TOPIC", "events"),
 		Log:     log,
 	}
+	// The same binary reads a delay topic: NINE_TOPIC=events.retry-5m with
+	// NINE_CONSUMER_DELAY=5m, its own group. The delay belongs to the topic,
+	// so it is configuration rather than a second program.
+	if raw := os.Getenv("NINE_CONSUMER_DELAY"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("NINE_CONSUMER_DELAY: %w", err)
+		}
+		if d < 0 {
+			return fmt.Errorf("NINE_CONSUMER_DELAY is %s, and a delay in the past is a setting that does nothing", d)
+		}
+		cfg.Delay = d
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -56,7 +70,8 @@ func run(log *slog.Logger) error {
 	}
 	defer c.Close()
 
-	log.Info("core joining", "brokers", cfg.Brokers, "group", cfg.Group, "topic", cfg.Topic, "fault_injection", faultInjection)
+	log.Info("core joining", "brokers", cfg.Brokers, "group", cfg.Group, "topic", cfg.Topic,
+		"delay", cfg.Delay, "fault_injection", faultInjection)
 	if err := c.Run(ctx); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}

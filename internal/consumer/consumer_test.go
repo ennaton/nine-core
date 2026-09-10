@@ -539,3 +539,181 @@ func TestCancelInsideAHandlerIsAShutdownNotAFatal(t *testing.T) {
 		t.Fatalf("committed %d, want 1: the record before the cancel was earned, the cancelled one was not", got)
 	}
 }
+
+// CO4.2. A record on a delay topic is not handed over before it has sat there
+// for the delay. The shipped delays are five minutes and one hour, from
+// nine-docs/adr/0001, and a test that waited either would not be a test. This
+// bounds the mechanism at three seconds and the shipped numbers stay unproven,
+// which is the trade Kemal named on nine-billing#32 and it is the same one.
+func TestADelayTopicIsNotReadBeforeItsTime(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 1)
+	const delay = 3 * time.Second
+
+	h := &answer{}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler), Delay: delay}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	produced := time.Now()
+	go func() { _ = c.Run(ctx) }()
+
+	// Not before its time. A second is a third of the delay: if the gate were
+	// missing the record would already be handled, which is what the run
+	// without a delay below shows.
+	time.Sleep(time.Second)
+	if n := h.count(); n != 0 {
+		t.Fatalf("%d records handled after 1s of a %s delay", n, delay)
+	}
+	if got := committed(t, brokers, "core"); got != 0 {
+		t.Fatalf("committed %d while holding the record, want 0", got)
+	}
+
+	waitFor(t, "the record after it ripens", func() bool { return h.count() == 1 })
+	waited := time.Since(produced)
+	if waited < delay {
+		t.Fatalf("handled after %s, which is less than the %s delay", waited, delay)
+	}
+	waitFor(t, "the offset after the record", func() bool { return committed(t, brokers, "core") == 1 })
+	cancel()
+	c.Close()
+}
+
+// The same topic with no delay: the record is handled at once. Without this,
+// the test above would pass on a consumer that had simply stopped working.
+func TestWithNoDelayTheSameRecordIsHandledAtOnce(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 1)
+	h := &answer{}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler)}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Run(ctx) }()
+	waitFor(t, "the record", func() bool { return h.count() == 1 })
+	cancel()
+	c.Close()
+}
+
+// Order survives the wait. A held partition is taken up again at exactly the
+// record it stopped at, so nothing is skipped and nothing arrives twice, and
+// the later records on that partition are not read past the held one.
+func TestAHeldPartitionResumesAtTheRecordItStoppedAt(t *testing.T) {
+	brokers := cluster(t, 1)
+	produce(t, brokers, 5)
+	h := &answer{}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler), Delay: 2 * time.Second}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Run(ctx) }()
+	waitFor(t, "all five, once they ripen", func() bool { return h.count() >= 5 })
+	cancel()
+	c.Close()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.seen) != 5 {
+		t.Fatalf("handled %d records, want 5 exactly: %v", len(h.seen), h.seen)
+	}
+	for i, id := range h.seen {
+		if want := fmt.Sprintf("event-%d", i); id != want {
+			t.Fatalf("record %d is %s, want %s: the resume did not land where the hold stopped", i, id, want)
+		}
+	}
+	if got := committed(t, brokers, "core"); got != 5 {
+		t.Fatalf("committed %d, want 5", got)
+	}
+}
+
+// The clock is the record's own timestamp, so a record that has already sat
+// on the topic for longer than the delay is ripe on arrival and waits for
+// nothing. Measured by producing with a timestamp in the past, which is what
+// a consumer restarting after an outage reads.
+func TestARecordOlderThanTheDelayIsRipeOnArrival(t *testing.T) {
+	brokers := cluster(t, 1)
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := &kgo.Record{Topic: topic, Key: []byte("t"), Value: []byte("event-old"),
+		Timestamp: time.Now().Add(-time.Hour)}
+	if err := cl.ProduceSync(context.Background(), old).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	cl.Close()
+
+	h := &answer{}
+	c, err := New(Config{Brokers: brokers, Group: "core", Log: slog.New(slog.DiscardHandler), Delay: 30 * time.Second}, decode, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	go func() { _ = c.Run(ctx) }()
+	waitFor(t, "the old record", func() bool { return h.count() == 1 })
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("an hour old record waited %s behind a 30s delay", took)
+	}
+	cancel()
+	c.Close()
+}
+
+// The reason the wait is a pause and a seek rather than a sleep. A consumer
+// sleeping out a five minute delay inside its batch holds the partition for
+// five minutes, and with BlockRebalanceOnPoll it holds every rebalance too, so
+// a deploy waits behind a retry topic. Here the delay is a minute and the
+// second member has to arrive in seconds.
+func TestAHeldPartitionDoesNotHoldTheRebalance(t *testing.T) {
+	brokers := cluster(t, 3)
+	produce(t, brokers, 30)
+	as := &assignments{}
+	h := &answer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	start := func(name string) {
+		c, err := New(Config{Brokers: brokers, Group: "core", Log: as.logger(name),
+			Session: 6 * time.Second, Delay: time.Minute}, decode, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer c.Close()
+			if err := c.Run(ctx); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	start("a")
+	waitFor(t, "a holds the whole topic", func() bool { return len(as.holding("a")) == 3 })
+	// Every partition is now paused behind a minute of delay. Nothing is
+	// being handled and nothing will be for a minute.
+	if n := h.count(); n != 0 {
+		t.Fatalf("%d records handled behind a one minute delay", n)
+	}
+
+	joined := time.Now()
+	start("b")
+	waitFor(t, "the topic split while every partition is held", func() bool {
+		return len(as.holding("a")) > 0 && len(as.holding("b")) > 0 &&
+			len(as.holding("a"))+len(as.holding("b")) == 3
+	})
+	if took := time.Since(joined); took > 30*time.Second {
+		t.Fatalf("the rebalance took %s behind a one minute delay, which means the wait held it", took)
+	}
+	if n := h.count(); n != 0 {
+		t.Fatalf("%d records were handled early, and the delay is the point", n)
+	}
+	cancel()
+	wg.Wait()
+}

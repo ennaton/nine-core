@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -65,6 +66,19 @@ type Config struct {
 	// outlives the caller's: a shutdown that lands inside a batch must not
 	// turn earned offsets into a failed commit. Default 10s.
 	CommitTimeout time.Duration
+	// Delay makes this a delay topic reader (CO4.2): a record is not handed
+	// to the handler until it has sat on the topic for this long. Zero, the
+	// default, reads `events` and hands every record over at once.
+	//
+	// The clock it measures against is the record's own timestamp, which is
+	// the moment it was produced onto this topic. That is the right clock
+	// here and the wrong one for anything else: nine-docs/adr/0003 measured
+	// that a forwarded record loses the time of the failure it is about, so
+	// "how long has it waited here" is the record's timestamp and "how old is
+	// the trouble" is a header.
+	Delay time.Duration
+	// Now is the clock, so a test can move it. Defaults to time.Now.
+	Now func() time.Time
 }
 
 func (c Config) withDefaults() Config {
@@ -83,6 +97,9 @@ func (c Config) withDefaults() Config {
 	if c.CommitTimeout <= 0 {
 		c.CommitTimeout = 10 * time.Second
 	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
 	return c
 }
 
@@ -93,6 +110,12 @@ type Consumer[T any] struct {
 	handler pipeline.Handler[T]
 	sink    Sink
 	hook    CommitHook
+
+	// waiting holds the partitions paused because their next record is not
+	// ripe, and the moment each becomes so. Guarded because the rebalance
+	// callbacks clear it from the client's goroutine.
+	mu      sync.Mutex
+	waiting map[int32]time.Time
 }
 
 type Option[T any] func(*Consumer[T])
@@ -113,7 +136,7 @@ func New[T any](cfg Config, decode Decoder[T], h pipeline.Handler[T], opts ...Op
 		return nil, errors.New("consumer: brokers and group are required")
 	}
 	cfg = cfg.withDefaults()
-	c := &Consumer[T]{cfg: cfg, decode: decode, handler: h}
+	c := &Consumer[T]{cfg: cfg, decode: decode, handler: h, waiting: map[int32]time.Time{}}
 	for _, o := range opts {
 		o(c)
 	}
@@ -129,8 +152,21 @@ func New[T any](cfg Config, decode Decoder[T], h pipeline.Handler[T], opts ...Op
 		}
 	}
 	assigned := on(slog.LevelInfo, "partitions assigned")
-	revoked := on(slog.LevelInfo, "partitions revoked")
-	lost := on(slog.LevelWarn, "partitions lost")
+	// A partition this consumer no longer holds is not one it is waiting on.
+	// Without this, a partition that came back after a rebalance would stay
+	// in the map and its records would be held until a stale deadline.
+	forget := func(next func(context.Context, *kgo.Client, map[string][]int32)) func(context.Context, *kgo.Client, map[string][]int32) {
+		return func(ctx context.Context, cl *kgo.Client, m map[string][]int32) {
+			c.mu.Lock()
+			for _, p := range m[cfg.Topic] {
+				delete(c.waiting, p)
+			}
+			c.mu.Unlock()
+			next(ctx, cl, m)
+		}
+	}
+	revoked := forget(on(slog.LevelInfo, "partitions revoked"))
+	lost := forget(on(slog.LevelWarn, "partitions lost"))
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
@@ -178,11 +214,76 @@ var ErrStopped = errors.New("consumer stopped")
 // acknowledgements.
 func (c *Consumer[T]) Run(ctx context.Context) error {
 	for {
-		fetches := c.cl.PollRecords(ctx, c.cfg.MaxPoll)
+		c.resumeRipe()
+		pollCtx, cancel := c.pollDeadline(ctx)
+		fetches := c.cl.PollRecords(pollCtx, c.cfg.MaxPoll)
+		cancel()
+		if ctx.Err() == nil && pollCtx.Err() != nil {
+			// The deadline was the wait, not a shutdown: a partition is
+			// ripe now, or close to it. Round again.
+			c.cl.AllowRebalance()
+			continue
+		}
 		if done, err := c.batch(ctx, fetches); done {
 			return err
 		}
 	}
+}
+
+// pollDeadline bounds the poll by the soonest partition that becomes ripe.
+// Without it a consumer whose every partition is paused would block in
+// PollRecords forever, because a paused partition never produces a fetch.
+func (c *Consumer[T]) pollDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	c.mu.Lock()
+	var soonest time.Time
+	for _, at := range c.waiting {
+		if soonest.IsZero() || at.Before(soonest) {
+			soonest = at
+		}
+	}
+	c.mu.Unlock()
+	if soonest.IsZero() {
+		return ctx, func() {}
+	}
+	wait := soonest.Sub(c.cfg.Now())
+	if wait < 10*time.Millisecond {
+		wait = 10 * time.Millisecond
+	}
+	return context.WithTimeout(ctx, wait)
+}
+
+// resumeRipe unpauses every partition whose held record has aged into the
+// delay. The record itself is re-fetched: process seeked back to it before
+// pausing, so nothing was skipped.
+func (c *Consumer[T]) resumeRipe() {
+	now := c.cfg.Now()
+	var ready []int32
+	c.mu.Lock()
+	for p, at := range c.waiting {
+		if !now.Before(at) {
+			ready = append(ready, p)
+			delete(c.waiting, p)
+		}
+	}
+	c.mu.Unlock()
+	if len(ready) > 0 {
+		c.cl.ResumeFetchPartitions(map[string][]int32{c.cfg.Topic: ready})
+	}
+}
+
+// hold stops reading one partition until the record at this offset is ripe.
+// The offset is set back to the record, so the pause loses nothing: the same
+// record is fetched again when the partition resumes.
+func (c *Consumer[T]) hold(r *kgo.Record, until time.Time) {
+	c.cl.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+		c.cfg.Topic: {r.Partition: {Epoch: r.LeaderEpoch, Offset: r.Offset}},
+	})
+	c.cl.PauseFetchPartitions(map[string][]int32{c.cfg.Topic: {r.Partition}})
+	c.mu.Lock()
+	c.waiting[r.Partition] = until
+	c.mu.Unlock()
+	c.cfg.Log.Debug("waiting for a record to ripen",
+		"partition", r.Partition, "offset", r.Offset, "until", until)
 }
 
 // batch is one poll's worth of work, in its own function so that the one
@@ -226,9 +327,24 @@ func (c *Consumer[T]) process(ctx context.Context, fetches kgo.Fetches) (acked [
 		}
 		c.cfg.Log.Warn("fetch error", "partition", p, "err", err)
 	})
+	// A partition held for ripeness this round: every later record on it is
+	// younger still, so there is nothing to gain by looking at them.
+	held := map[int32]bool{}
 	iter := fetches.RecordIter()
 	for !iter.Done() {
 		r := iter.Next()
+		if held[r.Partition] {
+			continue
+		}
+		if until, ok := c.ripe(r); !ok {
+			// CO4.2. The record has not sat here long enough. Stop this
+			// partition at exactly this offset and take it up again when it
+			// has: the offsets before it are committed by the caller, this
+			// one is not, and nothing is skipped or delivered early.
+			c.hold(r, until)
+			held[r.Partition] = true
+			continue
+		}
 		if err := c.one(ctx, r); err != nil {
 			if ctx.Err() != nil {
 				// The handler failed because the shutdown cancelled the
@@ -242,6 +358,18 @@ func (c *Consumer[T]) process(ctx context.Context, fetches kgo.Fetches) (acked [
 		acked = append(acked, r)
 	}
 	return acked, nil
+}
+
+// ripe answers whether a record has waited out the delay, and if not, when it
+// will have. The clock is the record's own timestamp: the moment the broker
+// recorded it on this topic, which is when its wait started. A record on a
+// topic with no delay is always ripe.
+func (c *Consumer[T]) ripe(r *kgo.Record) (time.Time, bool) {
+	if c.cfg.Delay <= 0 {
+		return time.Time{}, true
+	}
+	until := r.Timestamp.Add(c.cfg.Delay)
+	return until, !c.cfg.Now().Before(until)
 }
 
 // one takes a record to an outcome and returns nil when its offset may be
