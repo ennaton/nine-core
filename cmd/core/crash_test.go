@@ -112,6 +112,18 @@ func scratchDatabase(t *testing.T, owner string) (*pgx.Conn, string) {
 	if err != nil {
 		t.Fatalf("connect as owner: %v", err)
 	}
+	// The consumer connects as nine_app, which the compose stack creates in
+	// init.sql and a bare service container does not. Creating it here rather
+	// than requiring it keeps the test the same test in both places.
+	var exists bool
+	if err := admin.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nine_app')").Scan(&exists); err != nil {
+		t.Fatalf("look for nine_app: %v", err)
+	}
+	if !exists {
+		if _, err := admin.Exec(ctx, "CREATE ROLE nine_app LOGIN PASSWORD 'nine_app_dev'"); err != nil { // nine:allow-secret, a throwaway role in a throwaway database
+			t.Fatalf("create nine_app: %v", err)
+		}
+	}
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
