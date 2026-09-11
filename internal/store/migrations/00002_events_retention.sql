@@ -21,15 +21,23 @@ CREATE TABLE events_partition_drops (
     partition_name TEXT        NOT NULL,
     range_start    TIMESTAMPTZ NOT NULL,
     range_end      TIMESTAMPTZ NOT NULL,
-    -- Exact, not an estimate. The count is taken after the detach, when the
-    -- partition is a standalone table nothing else reads: measured on
-    -- PostgreSQL 16, 200,000 rows in 0.11 s with a write open on the parent,
-    -- which is the reason the earlier design's reltuples estimate is not needed.
-    rows_dropped   BIGINT      NOT NULL,
-    detached_at    TIMESTAMPTZ NOT NULL,
+    -- Null until the partition is detached and counted. The row is written
+    -- before anything is touched, so the window between detaching a partition
+    -- and being able to say so is empty: a run that dies in it leaves a row
+    -- with three nulls rather than a detached table nobody is looking for.
+    -- Exact rather than an estimate, because the count is taken after the
+    -- detach, when the partition is standalone and nothing else reads it:
+    -- measured on PostgreSQL 16, 200,000 rows in 0.11 s with a write open on
+    -- the parent.
+    rows_dropped   BIGINT,
+    detached_at    TIMESTAMPTZ,
     dropped_at     TIMESTAMPTZ
 );
 
+-- One row per partition, ever. A partition name is its ISO week, so a second
+-- row for one name would mean the same week was dropped twice, and a run that
+-- resumes an unfinished one completes the row rather than adding to it.
+CREATE UNIQUE INDEX events_partition_drops_name_key ON events_partition_drops (partition_name);
 CREATE INDEX events_partition_drops_range_idx ON events_partition_drops (range_end DESC);
 
 -- The replay tool reads this as nine_app. It never writes: retention is DDL and

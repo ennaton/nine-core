@@ -54,8 +54,24 @@ func main() {
 	}
 
 	if *retain > 0 {
+		// The two halves of this command must not fight. EnsurePartitions keeps
+		// -behind weeks before the current one alive for events reported late,
+		// and a retention shorter than that drops a week this same command will
+		// recreate empty on its next run. The recreated week accepts an event
+		// that was already counted, because the unique index cannot see rows
+		// that went away with the partition: nine-docs/adr/0002.
+		if floor := time.Duration(span.WithDefaults().Behind+1) * 7 * 24 * time.Hour; *retain < floor {
+			fail(fmt.Errorf("-retain %s is shorter than the %s this command keeps alive with -behind %d: it would drop a week and then recreate it",
+				*retain, floor, span.WithDefaults().Behind))
+		}
 		dropped, err := store.Retain(ctx, dsn, time.Now(), *retain)
 		if err != nil {
+			// Whatever was dropped before the failure is still dropped, and the
+			// record says so; printing it is how the operator knows where it
+			// stopped rather than guessing from the error alone.
+			for _, d := range dropped {
+				fmt.Println("dropped " + d.Name)
+			}
 			fail(err)
 		}
 		for _, d := range dropped {

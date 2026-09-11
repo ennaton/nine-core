@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,6 +40,11 @@ var ErrPartitionNotPast = errors.New("partition is not wholly past the retention
 // partition were ours to drop, and it is the wrong move otherwise, because
 // FINALIZE takes live data out of the table. So a pending detach on a partition
 // this run would not have dropped is a stop rather than a step.
+// ErrClockAhead is a caller whose idea of now is ahead of the database's. The
+// boundary is arithmetic on now, so a fast clock moves it forward and takes
+// live partitions with it.
+var ErrClockAhead = errors.New("the caller's clock is ahead of the database's")
+
 var ErrPendingDetachElsewhere = errors.New("a partition outside the retention boundary is half detached")
 
 // Dropped is one line of the record, returned so the caller can print what it
@@ -59,16 +65,27 @@ func parseBounds(expr string) (time.Time, time.Time, error) {
 	if m == nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("retention: cannot read partition bounds %q", expr)
 	}
-	const layout = "2006-01-02 15:04:05-07"
-	from, err := time.Parse(layout, m[1])
+	from, err := parseBound(m[1])
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("retention: lower bound %q: %w", m[1], err)
 	}
-	to, err := time.Parse(layout, m[2])
+	to, err := parseBound(m[2])
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("retention: upper bound %q: %w", m[2], err)
 	}
 	return from.UTC(), to.UTC(), nil
+}
+
+// parseBound takes what the server rendered, which depends on its TimeZone: an
+// offset of whole hours comes out as +00 and a half hour one as +05:30. A single
+// Go layout cannot take both, so both are tried and neither is guessed at.
+func parseBound(s string) (time.Time, error) {
+	for _, layout := range []string{"2006-01-02 15:04:05-07", "2006-01-02 15:04:05-07:00"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("neither a whole hour nor a half hour offset")
 }
 
 // Retain drops every partition whose whole range is older than now minus keep,
@@ -102,6 +119,18 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration) 
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, lockKey)
 
+	// The caller's clock decides what is past, and nothing else here checks it:
+	// measured, a now 56 days ahead dropped seven partitions including the week
+	// holding the real now, with no error. So it is compared against the clock
+	// of the database that holds the data, and a caller running ahead is a stop.
+	var dbNow time.Time
+	if err := conn.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+		return nil, fmt.Errorf("retention: %w", err)
+	}
+	if skew := now.UTC().Sub(dbNow.UTC()); skew > time.Minute {
+		return nil, fmt.Errorf("%w: %s ahead of the database", ErrClockAhead, skew.Round(time.Second))
+	}
+
 	boundary := now.UTC().Add(-keep)
 	candidates, err := pastPartitions(ctx, conn, boundary)
 	if err != nil {
@@ -117,7 +146,7 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration) 
 	} else if pending != "" {
 		i := indexOf(candidates, pending)
 		if i < 0 {
-			return nil, fmt.Errorf("%w: %s, finish or reattach it by hand", ErrPendingDetachElsewhere, pending)
+			return nil, fmt.Errorf("%w: %s, finish it with DETACH ... FINALIZE and then ATTACH it back, in that order", ErrPendingDetachElsewhere, pending)
 		}
 		candidates = append([]candidate{candidates[i]}, append(candidates[:i:i], candidates[i+1:]...)...)
 	}
@@ -197,17 +226,44 @@ func pastPartitions(ctx context.Context, conn *pgx.Conn, boundary time.Time) ([]
 		}
 		out = append(out, candidate{name: name, from: from, to: to, detachIsPending: pending})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Oldest first by bounds rather than by name, because the guard reads bounds
+	// and a name is a convention that a later week could break.
+	sort.Slice(out, func(i, j int) bool { return out[i].from.Before(out[j].from) })
+	return out, nil
 }
 
 // dropOne carries one partition through the order above. It is deliberately not
 // one transaction: DETACH CONCURRENTLY cannot run inside one, and the record has
 // to be committed before the drop rather than with it.
 func dropOne(ctx context.Context, conn *pgx.Conn, c candidate, now time.Time) (Dropped, error) {
-	// A run that was cancelled between the two statements leaves the partition
-	// half detached, and repeating the detach then fails with "already pending
-	// detach". Measured on PostgreSQL 16: the recovery is FINALIZE, not another
-	// detach, and a retention job that retries the detach fails forever.
+	// The record goes first, before anything is touched, and that is the whole
+	// point of the order. The first version of this detached and then recorded,
+	// and the window between the two was the one state nothing could see: the
+	// parent no longer holds the rows, the detached table is not inherited so no
+	// later run finds it, and there is no row anywhere. Measured on a run killed
+	// there: parent 0 rows, the detached table still holding 6, records 0, and
+	// the next clean run returning nil having seen nothing.
+	//
+	// ON CONFLICT because the name is the ISO week and a week is dropped once:
+	// a run that resumes an unfinished one completes its row rather than adding
+	// a second.
+	var id int64
+	err := conn.QueryRow(ctx, `
+		INSERT INTO events_partition_drops (partition_name, range_start, range_end)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (partition_name) DO UPDATE SET range_start = EXCLUDED.range_start
+		RETURNING id`, c.name, c.from, c.to).Scan(&id)
+	if err != nil {
+		return Dropped{}, fmt.Errorf("retention: record %s: %w", c.name, err)
+	}
+
+	// A run that was cancelled between the two halves of a concurrent detach
+	// leaves the partition half detached, and repeating the detach then fails
+	// with "already pending detach". Measured on PostgreSQL 16: the recovery is
+	// FINALIZE, not another detach.
 	stmt := fmt.Sprintf(`ALTER TABLE events DETACH PARTITION %s CONCURRENTLY`, quoteIdent(c.name))
 	if c.detachIsPending {
 		stmt = fmt.Sprintf(`ALTER TABLE events DETACH PARTITION %s FINALIZE`, quoteIdent(c.name))
@@ -215,22 +271,16 @@ func dropOne(ctx context.Context, conn *pgx.Conn, c candidate, now time.Time) (D
 	if _, err := conn.Exec(ctx, stmt); err != nil {
 		return Dropped{}, fmt.Errorf("retention: detach %s: %w", c.name, err)
 	}
-	detachedAt := now.UTC()
 
 	// Exact, because the partition is standalone now and nothing else reads it.
 	var rows int64
 	if err := conn.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, quoteIdent(c.name))).Scan(&rows); err != nil {
 		return Dropped{}, fmt.Errorf("retention: count %s: %w", c.name, err)
 	}
-
-	var id int64
-	err := conn.QueryRow(ctx, `
-		INSERT INTO events_partition_drops
-		    (partition_name, range_start, range_end, rows_dropped, detached_at)
-		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		c.name, c.from, c.to, rows, detachedAt).Scan(&id)
-	if err != nil {
-		return Dropped{}, fmt.Errorf("retention: record %s: %w", c.name, err)
+	if _, err := conn.Exec(ctx, `
+		UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
+		rows, now.UTC(), id); err != nil {
+		return Dropped{}, fmt.Errorf("retention: record the count for %s: %w", c.name, err)
 	}
 
 	if _, err := conn.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, quoteIdent(c.name))); err != nil {
