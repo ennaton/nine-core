@@ -15,22 +15,46 @@ import (
 // promise, and it is the one operation in this package that destroys data.
 //
 // The order is the whole design, and it comes from measurement rather than
-// preference (nine-core/docs/artifacts/2026-09-09-what-retention-must-do-to-a-partition.md):
+// preference (nine-core/docs/artifacts/2026-09-09-what-retention-must-do-to-a-partition.md
+// and its 11 September addendum):
 //
+//  0. refuse a promise shorter than the horizon keeps alive, a clock ahead of
+//     the database's, and a week that was dropped once and is back,
 //  1. refuse if events carries a default partition, because a default partition
 //     makes DETACH CONCURRENTLY fail outright and every run after it,
 //  2. refuse any partition that is not wholly past the boundary, which is the
 //     board's criterion: an active partition cannot be dropped by accident,
-//  3. detach concurrently, or finish a detach a previous run left pending,
+//  3. write the record, before anything is touched,
+//  4. detach concurrently, or finish a detach a previous run left pending,
 //     because a plain detach takes AccessExclusiveLock on the parent and stops
 //     the write path for its duration,
-//  4. count and record, while the partition is still a standalone table,
-//  5. drop, and only then stamp the record.
+//  5. count and fill the record in, while the partition is standalone,
+//  6. drop, and only then stamp the record.
 //
-// Step five is last for the reason nine-billing's V13 arrived at: a run that
-// dies between the record and the drop leaves a row that says so, and a
-// detached partition nobody recorded is an orphan invisible through the parent.
-var ErrPartitionNotPast = errors.New("partition is not wholly past the retention boundary")
+// Step three is third because the first version of this had it fifth. Measured
+// on a run killed between the detach and the record: the parent no longer held
+// the rows, the detached table still held six, no row described it, and the
+// next clean run returned nil having seen nothing, because a detached table is
+// not inherited and nothing looks for it.
+
+// ErrKeepInsideHorizon is a promise shorter than the weeks the horizon
+// maintainer keeps alive. Dropping one of those weeks means the maintainer
+// recreates it empty, and a recreated week is the one nine-docs/adr/0002 says
+// can hold an event counted twice.
+var ErrKeepInsideHorizon = errors.New("the retention promise is inside the horizon the maintainer keeps alive")
+
+// ErrClockAhead is a caller whose idea of now is ahead of the database's. The
+// boundary is arithmetic on now, so a fast clock moves it forward and takes
+// live partitions with it.
+var ErrClockAhead = errors.New("the caller's clock is ahead of the database's")
+
+// ErrWeekReturned is a week that was dropped once and is in the table again.
+// The record still says it was dropped, so overwriting that row would leave a
+// row vouching for a partition that exists. It is also the state nine-docs/adr/0002
+// warns about from the other side: the unique index cannot see what went away
+// with the partition, so a returned week may already hold an event counted
+// twice, and that is a person's decision rather than a retention run's.
+var ErrWeekReturned = errors.New("a week that was already dropped is in the table again")
 
 // ErrPendingDetachElsewhere is a partition left half detached by something that
 // is not this run, and that this run must not finish. Postgres allows one
@@ -40,11 +64,6 @@ var ErrPartitionNotPast = errors.New("partition is not wholly past the retention
 // partition were ours to drop, and it is the wrong move otherwise, because
 // FINALIZE takes live data out of the table. So a pending detach on a partition
 // this run would not have dropped is a stop rather than a step.
-// ErrClockAhead is a caller whose idea of now is ahead of the database's. The
-// boundary is arithmetic on now, so a fast clock moves it forward and takes
-// live partitions with it.
-var ErrClockAhead = errors.New("the caller's clock is ahead of the database's")
-
 var ErrPendingDetachElsewhere = errors.New("a partition outside the retention boundary is half detached")
 
 // Dropped is one line of the record, returned so the caller can print what it
@@ -92,7 +111,15 @@ func parseBound(s string) (time.Time, error) {
 // and returns what it dropped. Keep is the promise: 30 days of retention means
 // keep = 30 * 24h, and a partition survives until its newest possible row is
 // older than that, which is why the interval is the resolution of the promise.
-func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration) ([]Dropped, error) {
+// Retain takes the horizon's span rather than assuming it. The floor below is
+// the whole reason: a promise shorter than the weeks the maintainer keeps alive
+// drops a week the maintainer then recreates empty. An earlier version of this
+// hard coded the default span, and measured on -behind 6 with a promise at that
+// default's floor it dropped three weeks the horizon was keeping, four rows
+// among them, where the check it replaced had refused the same command. So the
+// caller passes the span it runs the maintainer with, and passing a different
+// one is the one way left to get this wrong.
+func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration, span PartitionSpan) ([]Dropped, error) {
 	if keep <= 0 {
 		return nil, fmt.Errorf("retention: keep must be positive, was %s", keep)
 	}
@@ -129,6 +156,16 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration) 
 	}
 	if skew := now.UTC().Sub(dbNow.UTC()); skew > time.Minute {
 		return nil, fmt.Errorf("%w: %s ahead of the database", ErrClockAhead, skew.Round(time.Second))
+	}
+
+	// The floor is the span the maintainer keeps behind, and no more: the oldest
+	// week it keeps ends one week after its start, so a promise of that many
+	// weeks already clears it. Walked across all seven weekdays at exactly this
+	// value, the oldest maintained week survived every time.
+	floor := time.Duration(span.withDefaults().Behind) * 7 * 24 * time.Hour
+	if keep < floor {
+		return nil, fmt.Errorf("%w: %s against the %s kept behind by -behind %d",
+			ErrKeepInsideHorizon, keep, floor, span.withDefaults().Behind)
 	}
 
 	boundary := now.UTC().Add(-keep)
@@ -247,15 +284,20 @@ func dropOne(ctx context.Context, conn *pgx.Conn, c candidate, now time.Time) (D
 	// there: parent 0 rows, the detached table still holding 6, records 0, and
 	// the next clean run returning nil having seen nothing.
 	//
-	// ON CONFLICT because the name is the ISO week and a week is dropped once:
-	// a run that resumes an unfinished one completes its row rather than adding
-	// a second.
+	// ON CONFLICT so a run that resumes an unfinished one completes its row, and
+	// the WHERE so it only resumes an unfinished one. A row that already says
+	// dropped belongs to a week that came back, and updating it would leave the
+	// record vouching for a partition that is there.
 	var id int64
 	err := conn.QueryRow(ctx, `
 		INSERT INTO events_partition_drops (partition_name, range_start, range_end)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (partition_name) DO UPDATE SET range_start = EXCLUDED.range_start
+		 WHERE events_partition_drops.dropped_at IS NULL
 		RETURNING id`, c.name, c.from, c.to).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Dropped{}, fmt.Errorf("%w: %s, dropped once already and recreated since", ErrWeekReturned, c.name)
+	}
 	if err != nil {
 		return Dropped{}, fmt.Errorf("retention: record %s: %w", c.name, err)
 	}

@@ -11,11 +11,12 @@
 -- replay from events.parked that crosses it either stops the consumer or counts
 -- an event twice, and this table is where the replay tool reads the line.
 --
--- dropped_at is nullable on purpose, the same shape reconciliation_runs arrived
--- at in nine-billing: the row is written after the partition is detached and
--- before it is dropped, so a run that dies in between leaves a row that says
--- so. A detached, undropped partition is invisible through the parent and
--- would otherwise be an orphan nobody is looking for.
+-- The three columns below are nullable on purpose, the same shape
+-- reconciliation_runs arrived at in nine-billing: the row is written before the
+-- partition is touched at all, and each column fills in as the work passes it.
+-- A run that dies anywhere leaves a row that says how far it got, and a
+-- detached undropped partition is invisible through the parent, so without the
+-- row first it would be an orphan nobody is looking for.
 CREATE TABLE events_partition_drops (
     id             BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     partition_name TEXT        NOT NULL,

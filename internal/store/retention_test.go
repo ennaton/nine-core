@@ -21,7 +21,14 @@ import (
 // guard, so a test cannot step around it by inventing a future. Instead the
 // partitions are created around the real now with the maintainer, which is what
 // production does, and the weeks behind it are genuinely past.
-const weeksBehind = 6
+// Eight, because the floor Retain enforces is three weeks and the tests need
+// weeks comfortably past it.
+const weeksBehind = 8
+
+// The maintainer's own window, which is what the floor is measured against and
+// is not the same thing as how far back these tests create partitions: the
+// history is eight weeks deep and the horizon keeps two of them alive.
+const horizonBehind = 2
 
 // olderWeek is a moment inside the week n weeks before this one, which is a
 // week the retention boundary can legitimately be past.
@@ -77,10 +84,10 @@ func TestAPastPartitionIsRecordedThenDropped(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(4)
+	old := olderWeek(6)
 	seed(t, c, old, 5)
 
-	dropped, err := Retain(ctx, dsn, time.Now(), 14*24*time.Hour)
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if err != nil {
 		t.Fatalf("retain: %v", err)
 	}
@@ -121,7 +128,7 @@ func TestThePartitionHoldingNowIsNeverDropped(t *testing.T) {
 	seed(t, c, time.Now().UTC(), 3)
 
 	// A promise longer than the table is old: nothing is past it.
-	dropped, err := Retain(ctx, dsn, time.Now(), 3650*24*time.Hour)
+	dropped, err := Retain(ctx, dsn, time.Now(), 3650*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if err != nil {
 		t.Fatalf("retain: %v", err)
 	}
@@ -132,10 +139,20 @@ func TestThePartitionHoldingNowIsNeverDropped(t *testing.T) {
 		t.Fatalf("events holds %d rows, want 3", n)
 	}
 
-	// And with a short promise, the week holding now still survives: its upper
-	// bound is in the future, so it is not wholly past anything.
-	if _, err := Retain(ctx, dsn, time.Now(), time.Hour); err != nil {
-		t.Fatalf("retain: %v", err)
+	// And at the shortest promise the floor allows, the week holding now still
+	// survives: its upper bound is in the future, so it is not wholly past
+	// anything. The floor is what keeps a shorter promise from being asked at
+	// all, and TestAKeepInsideTheHorizonIsRefused is that half.
+	// Written out rather than recomputed from the expression production uses: a
+	// test that derives its number from the code under test cannot disagree.
+	if _, err := Retain(ctx, dsn, time.Now(), time.Duration(horizonBehind)*7*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("retain at the floor: %v", err)
+	}
+	// On the partition rather than on the row count: with the boundary a whole
+	// horizon back, a count of three would hold simply because nothing else was
+	// seeded, and the sentence under test is about this week's partition.
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, partitionName(weekStart(time.Now().UTC()))); n != 1 {
+		t.Fatal("the partition holding now was dropped")
 	}
 	if n := rowsIn(t, c, `SELECT count(*) FROM events`); n != 3 {
 		t.Fatalf("the week holding now was dropped: events holds %d rows, want 3", n)
@@ -148,11 +165,19 @@ func TestAPartitionStraddlingTheBoundarySurvives(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	seed(t, c, time.Now().UTC(), 2)
+	// The boundary is put inside a week rather than between two: the promise is
+	// the floor plus half a week, so the week it lands in is partly newer than
+	// the promise and must survive whole.
+	keep := time.Duration(horizonBehind)*7*24*time.Hour + 84*time.Hour
+	straddling := time.Now().UTC().Add(-keep)
+	seed(t, c, straddling, 2)
+	name := partitionName(weekStart(straddling))
 
-	// Week 37 runs 7 to 14 September. A boundary inside it must not drop it.
-	if _, err := Retain(ctx, dsn, time.Now(), 2*24*time.Hour); err != nil {
+	if _, err := Retain(ctx, dsn, time.Now(), keep, PartitionSpan{Behind: horizonBehind}); err != nil {
 		t.Fatalf("retain: %v", err)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, name); n != 1 {
+		t.Fatalf("%s straddles the boundary and was dropped", name)
 	}
 	if n := rowsIn(t, c, `SELECT count(*) FROM events`); n != 2 {
 		t.Fatalf("a partition straddling the boundary was dropped: events holds %d rows, want 2", n)
@@ -166,7 +191,7 @@ func TestADefaultPartitionStopsRetention(t *testing.T) {
 	if _, err := c.Exec(ctx, `CREATE TABLE events_default PARTITION OF events DEFAULT`); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Retain(ctx, dsn, time.Now(), 14*24*time.Hour)
+	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if !errors.Is(err, ErrDefaultPartition) {
 		t.Fatalf("retain returned %v, want ErrDefaultPartition: a default partition makes every concurrent detach fail", err)
 	}
@@ -178,7 +203,7 @@ func TestAPendingDetachIsFinishedRatherThanRepeated(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(4)
+	old := olderWeek(6)
 	seed(t, c, old, 4)
 
 	name := partitionName(weekStart(old))
@@ -215,7 +240,7 @@ func TestAPendingDetachIsFinishedRatherThanRepeated(t *testing.T) {
 		t.Fatalf("the detach left %d partitions pending, want 1: the setup did not produce the state under test", pending)
 	}
 
-	dropped, err := Retain(ctx, dsn, time.Now(), 14*24*time.Hour)
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if err != nil {
 		t.Fatalf("retain over a pending detach: %v", err)
 	}
@@ -259,7 +284,7 @@ func TestAPendingDetachOutsideTheBoundaryStopsTheRun(t *testing.T) {
 		t.Fatal("the detach did not end up pending, so the setup did not produce the state under test")
 	}
 
-	_, err := Retain(ctx, dsn, time.Now(), 14*24*time.Hour)
+	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if !errors.Is(err, ErrPendingDetachElsewhere) {
 		t.Fatalf("retain returned %v, want ErrPendingDetachElsewhere", err)
 	}
@@ -287,7 +312,7 @@ func TestTheRecordExistsBeforeThePartitionIsTouched(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(4)
+	old := olderWeek(6)
 	seed(t, c, old, 3)
 	name := partitionName(weekStart(old))
 
@@ -305,7 +330,7 @@ func TestTheRecordExistsBeforeThePartitionIsTouched(t *testing.T) {
 
 	short, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	if _, err := Retain(short, dsn, time.Now(), 14*24*time.Hour); err == nil {
+	if _, err := Retain(short, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err == nil {
 		t.Fatal("retain returned nil while the drop was held: the test did not reach the state under test")
 	}
 
@@ -334,12 +359,12 @@ func TestAPartitionEndingExactlyAtTheBoundaryIsDropped(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(3)
+	old := olderWeek(5)
 	seed(t, c, old, 2)
 
 	now := time.Now().UTC()
 	end := weekStart(old).AddDate(0, 0, 7) // the partition's exclusive upper bound
-	dropped, err := Retain(ctx, dsn, now, now.Sub(end))
+	dropped, err := Retain(ctx, dsn, now, now.Sub(end), PartitionSpan{Behind: horizonBehind})
 	if err != nil {
 		t.Fatalf("retain: %v", err)
 	}
@@ -356,10 +381,10 @@ func TestAClockAheadOfTheDatabaseStopsTheRun(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(4)
+	old := olderWeek(6)
 	seed(t, c, old, 2)
 
-	_, err := Retain(ctx, dsn, time.Now().Add(2*time.Hour), 14*24*time.Hour)
+	_, err := Retain(ctx, dsn, time.Now().Add(2*time.Hour), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if !errors.Is(err, ErrClockAhead) {
 		t.Fatalf("retain returned %v, want ErrClockAhead: a fast host clock moves the boundary forward", err)
 	}
@@ -370,7 +395,7 @@ func TestAClockAheadOfTheDatabaseStopsTheRun(t *testing.T) {
 
 func TestKeepMustBePositive(t *testing.T) {
 	dsn := withHistory(t)
-	if _, err := Retain(context.Background(), dsn, time.Now(), 0); err == nil {
+	if _, err := Retain(context.Background(), dsn, time.Now(), 0, PartitionSpan{Behind: horizonBehind}); err == nil {
 		t.Fatal("a keep of zero was accepted, which would make the boundary now and drop everything past it")
 	}
 }
@@ -382,7 +407,7 @@ func TestTwoRetentionRunsAtOnceDoNotCollide(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
-	old := olderWeek(4)
+	old := olderWeek(6)
 	seed(t, c, old, 3)
 	name := partitionName(weekStart(old))
 
@@ -399,7 +424,10 @@ func TestTwoRetentionRunsAtOnceDoNotCollide(t *testing.T) {
 	first := make(chan error, 1)
 	held, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	go func() { _, err := Retain(held, dsn, time.Now(), 14*24*time.Hour); first <- err }()
+	go func() {
+		_, err := Retain(held, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+		first <- err
+	}()
 
 	// Wait for the lock to be taken, from the database rather than by sleeping.
 	deadline := time.After(10 * time.Second)
@@ -414,7 +442,7 @@ func TestTwoRetentionRunsAtOnceDoNotCollide(t *testing.T) {
 		}
 	}
 
-	_, err := Retain(ctx, dsn, time.Now(), 14*24*time.Hour)
+	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	if err == nil {
 		t.Fatal("the second run proceeded while the first held the lock")
 	}
@@ -423,4 +451,59 @@ func TestTwoRetentionRunsAtOnceDoNotCollide(t *testing.T) {
 	}
 	_, _ = holder.Exec(ctx, `ROLLBACK`)
 	<-first
+}
+
+// A week that was dropped and has come back. The record still says it went, so
+// there is nothing to resume, and updating that row would leave it vouching for
+// a partition that exists.
+func TestAWeekThatCameBackStopsTheRun(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 2)
+	name := partitionName(weekStart(old))
+
+	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// The horizon maintainer would do exactly this if its -behind reached back
+	// past the retention boundary.
+	ws := weekStart(old)
+	if _, err := c.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s PARTITION OF events FOR VALUES FROM ('%s') TO ('%s')`,
+		name, ws.Format("2006-01-02"), ws.AddDate(0, 0, 7).Format("2006-01-02"))); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, c, old, 3)
+
+	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if !errors.Is(err, ErrWeekReturned) {
+		t.Fatalf("second run returned %v, want ErrWeekReturned", err)
+	}
+	if n := rowsIn(t, c, fmt.Sprintf(`SELECT count(*) FROM %s`, name)); n != 3 {
+		t.Fatalf("%s holds %d rows, want 3: the run should have stopped before touching it", name, n)
+	}
+	// And the record still describes the first drop rather than the second.
+	var rows int64
+	if err := c.QueryRow(ctx, `SELECT rows_dropped FROM events_partition_drops WHERE partition_name=$1`, name).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("the record says %d rows, want the 2 of the drop that actually happened", rows)
+	}
+}
+
+// The floor is in Retain rather than in one caller, because every caller can
+// otherwise drop a week the horizon will recreate.
+func TestAKeepInsideTheHorizonIsRefused(t *testing.T) {
+	dsn := withHistory(t)
+	_, err := Retain(context.Background(), dsn, time.Now(), 7*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err == nil {
+		t.Fatal("a keep of one week was accepted, and the horizon keeps two weeks behind alive")
+	}
+	if !errors.Is(err, ErrKeepInsideHorizon) {
+		t.Fatalf("refused with %v, want ErrKeepInsideHorizon", err)
+	}
 }
