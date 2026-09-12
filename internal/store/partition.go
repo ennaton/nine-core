@@ -41,6 +41,11 @@ type PartitionSpan struct {
 	Behind int
 }
 
+// WithDefaults is withDefaults for a caller outside this package: the
+// retention flag has to know what the horizon actually keeps, and the defaults
+// are the answer when the flags were not given.
+func (s PartitionSpan) WithDefaults() PartitionSpan { return s.withDefaults() }
+
 func (s PartitionSpan) withDefaults() PartitionSpan {
 	if s.Ahead <= 0 {
 		s.Ahead = 4

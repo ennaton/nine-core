@@ -176,3 +176,24 @@ worth nothing as a guarantee: it is an estimate that is stale between analyzes,
 and a number that says how many rows were dropped is an audit line, not an
 invariant. If an exact count is ever wanted, it is a deliberate scan and not the
 default cost of every retention run.
+
+## Where the implementation disagreed, 11 September
+
+Two things this file got wrong, left here rather than edited into it, because it
+is dated working output and the record of what was measured on the ninth is
+worth more than a tidy one.
+
+**The record carries an exact count, not an estimate.** This file chose
+`reltuples` to avoid a full scan. It priced the scan on the live table; the count
+is taken after the detach, when the partition is a standalone table nothing else
+reads. Measured on the eleventh: 200,000 rows in 0.11 s with a write open on the
+parent. A weekly scan of a table nobody is using is not a cost worth an estimate.
+
+**One pending detach blocks every other detach on the table.** This file said the
+retry for a half detached partition is `FINALIZE`, which is right, and did not
+say that until it is finished nothing else can be detached at all. Measured:
+detaching `events_w2026_36` while `events_w2026_37` is pending fails with 55000,
+naming the other partition. So the pending one is dealt with first, and if it is
+not one this run would have dropped, the run stops rather than finishing a detach
+nobody here decided on: `FINALIZE` takes live data out of the table.
+

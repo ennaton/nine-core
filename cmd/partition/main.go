@@ -27,6 +27,12 @@ func main() {
 	flag.IntVar(&span.Ahead, "ahead", 4, "whole weeks past the current one that must exist")
 	flag.IntVar(&span.Behind, "behind", 2, "weeks before the current one that must exist, for events reported late")
 	list := flag.Bool("list", false, "print every partition and its bounds, and create nothing")
+	// Retention lives here because partition DDL is one job and belongs to one
+	// owner, and behind an explicit flag because this is the half that destroys
+	// data: creating an empty partition costs milliseconds and can be run by
+	// habit, dropping one cannot be undone. Zero means do nothing, so a
+	// scheduled run that forgets the flag extends the horizon and drops nothing.
+	retain := flag.Duration("retain", 0, "drop partitions wholly older than this, for example 720h; zero drops nothing")
 	flag.Parse()
 
 	dsn := os.Getenv("NINE_CORE_MIGRATE_DSN")
@@ -44,6 +50,30 @@ func main() {
 			fmt.Printf("%s  %s\n", name, bound)
 		}
 		fmt.Printf("%d partitions\n", len(parts))
+		return
+	}
+
+	if *retain > 0 {
+		// The same span the maintainer would run with, so the floor inside
+		// store.Retain is measured against the horizon this command actually
+		// keeps rather than against a default nobody chose.
+		dropped, err := store.Retain(ctx, dsn, time.Now(), *retain, span)
+		if err != nil {
+			// Whatever was dropped before the failure is still dropped, and the
+			// record says so; printing it is how the operator knows where it
+			// stopped rather than guessing from the error alone.
+			for _, d := range dropped {
+				fmt.Println("dropped " + d.Name)
+			}
+			fail(err)
+		}
+		for _, d := range dropped {
+			fmt.Printf("dropped %s covering %s to %s, %d rows\n",
+				d.Name, d.RangeStart.Format(time.DateOnly), d.RangeEnd.Format(time.DateOnly), d.Rows)
+		}
+		if len(dropped) == 0 {
+			fmt.Println("nothing is wholly past the boundary, nothing dropped")
+		}
 		return
 	}
 
