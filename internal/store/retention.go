@@ -18,13 +18,17 @@ import (
 // preference (nine-core/docs/artifacts/2026-09-09-what-retention-must-do-to-a-partition.md
 // and its 11 September addendum):
 //
-//  0. refuse a promise shorter than the horizon keeps alive, a clock ahead of
-//     the database's, and a week that was dropped once and is back,
+//  0. take the maintainer lock, then refuse a promise shorter than the horizon
+//     keeps alive and a clock ahead of the database's,
 //  1. refuse if events carries a default partition, because a default partition
 //     makes DETACH CONCURRENTLY fail outright and every run after it,
 //  2. refuse any partition that is not wholly past the boundary, which is the
 //     board's criterion: an active partition cannot be dropped by accident,
-//  3. write the record, before anything is touched,
+//  3. write the record, before anything is touched, which is also where a week
+//     that was dropped once and is back is refused, because the record is the
+//     only thing that remembers the drop: that refusal arrives per candidate,
+//     not up front, so candidates ahead of it in the same run are already
+//     gone when it stops,
 //  4. detach concurrently, or finish a detach a previous run left pending,
 //     because a plain detach takes AccessExclusiveLock on the parent and stops
 //     the write path for its duration,
@@ -36,6 +40,21 @@ import (
 // the rows, the detached table still held six, no row described it, and the
 // next clean run returned nil having seen nothing, because a detached table is
 // not inherited and nothing looks for it.
+//
+// The lock is step zero for a reason measured on this branch. Step one reads
+// pg_get_expr(relpartbound), which takes a lock on every partition and so waits
+// behind a detach already running. With that read ahead of the lock, a second
+// run spent seconds inside a check that refuses nothing before it could even
+// find out that it was the second run. EnsurePartitions had the two the right
+// way round; this now matches it. Nothing that can wait goes before the lock.
+
+// lockTimeout is how long any one statement here waits for a lock before it
+// gives up. Thirty seconds because a read still running that long on a
+// partition older than the whole retention promise is not an ordinary read,
+// and because the maintainer lock is held for the whole wait, so EnsurePartitions
+// waits behind it. It is a variable rather than a constant so the test that
+// proves the stop is resumable does not have to sit through it.
+var lockTimeout = 30 * time.Second
 
 // ErrKeepInsideHorizon is a promise shorter than the weeks the horizon
 // maintainer keeps alive. Dropping one of those weeks means the maintainer
@@ -129,8 +148,15 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration, 
 	}
 	defer conn.Close(ctx)
 
-	if err := refuseDefaultPartition(ctx, conn); err != nil {
-		return nil, err
+	// Neither half of a concurrent detach has a bound of its own, so a single
+	// long read on a partition holds the run there for as long as it lasts, and
+	// every EnsurePartitions run waits behind it for the maintainer lock.
+	// Measured with a reader held open: FINALIZE was still waiting at 6.1s with
+	// no timeout, and stopped at 2.1s with one. A detach stopped this way leaves
+	// the partition pending, which is the state the next run already finishes,
+	// so the timeout turns a silent hang into a stop that resumes itself.
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`SET lock_timeout = '%dms'`, lockTimeout.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("retention: %w", err)
 	}
 
 	// One maintainer at a time, the same lock cmd/partition takes: creating and
@@ -166,6 +192,10 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration, 
 	if keep < floor {
 		return nil, fmt.Errorf("%w: %s against the %s kept behind by -behind %d",
 			ErrKeepInsideHorizon, keep, floor, span.withDefaults().Behind)
+	}
+
+	if err := refuseDefaultPartition(ctx, conn); err != nil {
+		return nil, err
 	}
 
 	boundary := now.UTC().Add(-keep)

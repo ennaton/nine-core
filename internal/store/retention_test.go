@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // CO3.3. The criterion is two sentences: a record of the drop is kept, and an
@@ -45,6 +46,21 @@ func withHistory(t *testing.T) string {
 		t.Fatalf("history: %v", err)
 	}
 	return dsn
+}
+
+// createWeek makes the partition for the week holding at, which is what
+// EnsurePartitions does and what a wider -behind would do to an older week.
+func createWeek(t *testing.T, c *pgx.Conn, at time.Time) string {
+	t.Helper()
+	ws := weekStart(at)
+	name := partitionName(ws)
+	_, err := c.Exec(context.Background(), fmt.Sprintf(
+		`CREATE TABLE %s PARTITION OF events FOR VALUES FROM ('%s') TO ('%s')`,
+		name, ws.Format("2006-01-02"), ws.AddDate(0, 0, 7).Format("2006-01-02")))
+	if err != nil {
+		t.Fatalf("create %s: %v", name, err)
+	}
+	return name
 }
 
 func conn(t *testing.T, dsn string) *pgx.Conn {
@@ -442,12 +458,21 @@ func TestTwoRetentionRunsAtOnceDoNotCollide(t *testing.T) {
 		}
 	}
 
+	start := time.Now()
 	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("the second run proceeded while the first held the lock")
 	}
 	if !strings.Contains(err.Error(), "holds the lock") {
 		t.Fatalf("the second run failed with %v, want the lock message", err)
+	}
+	// Where the refusal comes from, not just that it came. With the catalog read
+	// ahead of the lock this waited out the first run's detach, seconds, inside a
+	// check that refuses nothing. A second is far above the milliseconds the lock
+	// costs and far below the wait it replaced.
+	if elapsed > time.Second {
+		t.Fatalf("the second run took %s to refuse, want the refusal to come from the lock", elapsed)
 	}
 	_, _ = holder.Exec(ctx, `ROLLBACK`)
 	<-first
@@ -470,12 +495,7 @@ func TestAWeekThatCameBackStopsTheRun(t *testing.T) {
 
 	// The horizon maintainer would do exactly this if its -behind reached back
 	// past the retention boundary.
-	ws := weekStart(old)
-	if _, err := c.Exec(ctx, fmt.Sprintf(
-		`CREATE TABLE %s PARTITION OF events FOR VALUES FROM ('%s') TO ('%s')`,
-		name, ws.Format("2006-01-02"), ws.AddDate(0, 0, 7).Format("2006-01-02"))); err != nil {
-		t.Fatal(err)
-	}
+	createWeek(t, c, old)
 	seed(t, c, old, 3)
 
 	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
@@ -505,5 +525,114 @@ func TestAKeepInsideTheHorizonIsRefused(t *testing.T) {
 	}
 	if !errors.Is(err, ErrKeepInsideHorizon) {
 		t.Fatalf("refused with %v, want ErrKeepInsideHorizon", err)
+	}
+}
+
+// The returned week is not always the first candidate, and the header says what
+// happens then: the run drops what comes before it and stops there. Nothing
+// asserted that, because the test above has a single candidate.
+func TestTheRunDropsWhatComesBeforeAReturnedWeekAndStopsThere(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	returned := olderWeek(6)
+	seed(t, c, returned, 2)
+	returnedName := partitionName(weekStart(returned))
+
+	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	createWeek(t, c, returned)
+	seed(t, c, returned, 2)
+
+	// A week older than the history, which is what widening -behind creates and
+	// which this table has never dropped. It sorts ahead of the returned one.
+	older := olderWeek(10)
+	olderName := createWeek(t, c, older)
+	seed(t, c, older, 3)
+
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if !errors.Is(err, ErrWeekReturned) {
+		t.Fatalf("the run returned %v, want ErrWeekReturned", err)
+	}
+	if len(dropped) != 1 || dropped[0].Name != olderName {
+		t.Fatalf("the run reported %v dropped, want only %s: what came before the stop is gone and has to be reported", dropped, olderName)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, olderName); n != 0 {
+		t.Fatalf("%s survived, and the run passed it before it stopped", olderName)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, returnedName); n != 1 {
+		t.Fatalf("%s was dropped, and a week that came back is exactly what must not be", returnedName)
+	}
+	if n := rowsIn(t, c, fmt.Sprintf(`SELECT count(*) FROM %s`, returnedName)); n != 2 {
+		t.Fatalf("%s holds %d rows, want the 2 seeded after it came back", returnedName, n)
+	}
+}
+
+// The detach has no bound of its own, so a single long read would hold the run,
+// and the maintainer lock with it, for as long as that read lasts. The timeout
+// turns that into a stop, and the state it leaves is the one the next run
+// already knows how to finish.
+func TestADetachThatCannotGetItsLockStopsAndTheNextRunFinishesIt(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 4)
+	name := partitionName(weekStart(old))
+
+	prev := lockTimeout
+	lockTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { lockTimeout = prev })
+
+	holder := conn(t, dsn)
+	if _, err := holder.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, name)); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	elapsed := time.Since(start)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("the run returned %v, want the lock timeout 55P03", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("the run took %s to give up, and the point of the timeout is that it cannot", elapsed)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhrelid
+	                       WHERE p.relname = $1 AND i.inhdetachpending`, name); n != 1 {
+		t.Fatalf("%s is not pending detach after the timeout, so the stop is not the state the next run resumes", name)
+	}
+
+	// The reader goes, and the next run finishes what this one started.
+	if _, err := holder.Exec(ctx, `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err != nil {
+		t.Fatalf("the run after the timeout: %v", err)
+	}
+	// It resumes the pending one and then carries on with the candidates the
+	// stopped run never reached, so what matters is that this week is among them
+	// and that its count is the real one, taken after the detach it finished.
+	var resumed *Dropped
+	for i := range dropped {
+		if dropped[i].Name == name {
+			resumed = &dropped[i]
+		}
+	}
+	if resumed == nil || resumed.Rows != 4 {
+		t.Fatalf("the run after the timeout reported %v, want %s among them with its 4 rows", dropped, name)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, name); n != 0 {
+		t.Fatalf("%s survived the run that was meant to finish it", name)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM events_partition_drops
+	                       WHERE partition_name = $1 AND dropped_at IS NOT NULL`, name); n != 1 {
+		t.Fatalf("the record for %s is not stamped, and the drop happened", name)
 	}
 }
