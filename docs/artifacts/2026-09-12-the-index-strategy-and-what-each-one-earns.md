@@ -11,11 +11,26 @@ and twenty one days, `ANALYZE` run before every plan. `EXPLAIN (ANALYZE, BUFFERS
 COSTS OFF, TIMING OFF)`, so the numbers are buffers rather than milliseconds:
 timings on a laptop under Docker say more about the laptop.
 
-## The queries that exist
+## Every query, and which of them exist
 
-Three touch `events`, three touch `events_partition_drops`. There are no others:
-`grep` for `FROM events`, `INTO events` and `UPDATE events` outside tests returns
-exactly these.
+Seven shapes are described here and five of them exist today. `grep` for
+`FROM events`, `INTO events` and `UPDATE events` outside tests returns exactly
+those five, run on `#24`'s head, which is where `retention.go` lands:
+
+```
+$ grep -rn "FROM events\|INTO events\|UPDATE events" . | grep -v _test.go | grep -v /docs/ | grep -v '\.md:'
+internal/store/store.go:75:INSERT INTO events (
+internal/store/store.go:106:	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE tenant_id = $1 AND event_id = $2`, tenant, eventID).Scan(&n)
+internal/store/retention.go:323:		INSERT INTO events_partition_drops (partition_name, range_start, range_end)
+internal/store/retention.go:353:		UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
+internal/store/retention.go:361:	if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), id); err != nil {
+```
+
+Two against `events`, three against `events_partition_drops`. The other two
+shapes, 3 and 7, have no caller in `nine-core` and so cannot appear in that grep;
+each is marked planned where it appears below. They are measured anyway, because
+the index each one would use is already in the migration, and whether that is
+justified is the question this file exists to answer.
 
 ### 1. The idempotent insert, `store.go`
 
@@ -54,7 +69,7 @@ for tests and operators. It is recorded because the shape must not travel: a rea
 path that asks for one event id without a time window pays the whole horizon, and
 `AP` should carry a window or an exact `occurred_at`.
 
-### 3. The read the API will do, tenant and a time window
+### 3. The read the API will do, tenant and a time window (planned, no caller)
 
 ```
 Limit
@@ -71,11 +86,12 @@ today: the index exists for a reader that has not been written. That is worth
 writing down precisely because a later count of callers would find zero and
 remove it.
 
-### 4, 5 and 6. `events_partition_drops`
+### 4, 5, 6 and 7. `events_partition_drops`
 
 The insert is `ON CONFLICT (partition_name)`, so the unique index is its arbiter,
-and the two updates are by primary key. The query that matters is the one the
-replay tool will run, and `nine-docs/adr/0002` is why it exists at all: the
+and the two updates are by primary key. The fourth, query 7, is planned and has no
+caller either: it is the one the replay tool will run, and `nine-docs/adr/0002`
+is why it exists at all: the
 retention boundary is also the boundary of the deduplication guarantee.
 
 ```
