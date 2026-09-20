@@ -13,24 +13,34 @@ timings on a laptop under Docker say more about the laptop.
 
 ## Every query, and which of them exist
 
-Seven shapes are described here and five of them exist today. `grep` for
-`FROM events`, `INTO events` and `UPDATE events` outside tests returns exactly
-those five, run on `#24`'s head, which is where `retention.go` lands:
+Eight shapes are described here and six of them exist. `grep` for `FROM events`,
+`INTO events` and `UPDATE events` outside tests returns eight lines, because two
+of those six shapes are issued from two places each: the resume step in `#24`
+repeats the record update and the stamp. Run on `#24` at `df72058`, which is
+where `retention.go` lands:
 
 ```
 $ grep -rn "FROM events\|INTO events\|UPDATE events" . | grep -v _test.go | grep -v /docs/ | grep -v '\.md:'
 internal/store/store.go:75:INSERT INTO events (
 internal/store/store.go:106:	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE tenant_id = $1 AND event_id = $2`, tenant, eventID).Scan(&n)
-internal/store/retention.go:323:		INSERT INTO events_partition_drops (partition_name, range_start, range_end)
-internal/store/retention.go:353:		UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
-internal/store/retention.go:361:	if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), id); err != nil {
+internal/store/retention.go:336:		INSERT INTO events_partition_drops (partition_name, range_start, range_end)
+internal/store/retention.go:366:		UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
+internal/store/retention.go:374:	if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), id); err != nil {
+internal/store/retention.go:415:		  FROM events_partition_drops d
+internal/store/retention.go:450:					UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
+internal/store/retention.go:461:		if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), u.id); err != nil {
 ```
 
-Two against `events`, three against `events_partition_drops`. The other two
+Two against `events`, four against `events_partition_drops`. The other two
 shapes, 3 and 7, have no caller in `nine-core` and so cannot appear in that grep;
 each is marked planned where it appears below. They are measured anyway, because
 the index each one would use is already in the migration, and whether that is
 justified is the question this file exists to answer.
+
+This count moves with `#24`. It was five shapes when this file was written, and
+the resume step added the eighth, which is why the commit is named above rather
+than left as "the head": a completeness claim that does not say what it was
+measured against is the sentence a later reader trusts by mistake.
 
 ### 1. The idempotent insert, `store.go`
 
@@ -100,6 +110,40 @@ SELECT max(range_end) FROM events_partition_drops
     ->  Index Only Scan using events_partition_drops_range_idx
   Buffers: shared hit=3
 ```
+
+### 8. The unfinished drop the resume step looks for
+
+Added by `#24`. It runs once per retention run, before any candidate is looked
+for, and it asks the only question the catalogue cannot answer on its own: is
+there a record of a drop that never finished, for a partition that is off the
+parent but still on disk.
+
+```
+Sort (actual rows=0 loops=1)
+  Sort Key: d.range_start
+  Buffers: shared hit=19
+  ->  Nested Loop Anti Join (actual rows=0 loops=1)
+        ->  Merge Right Join (actual rows=1 loops=1)
+              Merge Cond: (c.relname = d.partition_name)
+              ->  Index Scan using pg_class_relname_nsp_index on pg_class c (actual rows=10 loops=1)
+              ->  Sort (actual rows=1 loops=1)
+                    ->  Seq Scan on events_partition_drops d (actual rows=1 loops=1)
+                          Filter: (dropped_at IS NULL)
+                          Rows Removed by Filter: 52
+                          Buffers: shared hit=1
+```
+
+Measured on 53 records, 52 of them closed, one open, which is a year of weekly
+drops plus the one in flight. The seq scan reads a single buffer and the whole
+query nineteen, and it returns nothing in the ordinary case, which is the case
+that runs every time.
+
+No index for it, and that is a decision rather than an omission. The table gains
+about 52 rows a year, one per dropped week, so the filter walks a page. An index
+on `dropped_at` would be read once per run and maintained on every drop, to save
+a buffer. The number to watch is `Rows Removed by Filter` against the run time:
+the day this table holds enough rows for that to matter, the same measurement
+says so.
 
 ## What each index earns
 
