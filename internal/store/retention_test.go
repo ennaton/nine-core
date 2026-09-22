@@ -22,8 +22,8 @@ import (
 // guard, so a test cannot step around it by inventing a future. Instead the
 // partitions are created around the real now with the maintainer, which is what
 // production does, and the weeks behind it are genuinely past.
-// Eight, because the floor Retain enforces is three weeks and the tests need
-// weeks comfortably past it.
+// Eight, because the floor Retain enforces is the weeks the horizon keeps
+// behind, two by default, and the tests need weeks comfortably past it.
 const weeksBehind = 8
 
 // The maintainer's own window, which is what the floor is measured against and
@@ -593,8 +593,14 @@ func TestADetachThatCannotGetItsLockStopsAndTheNextRunFinishesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Bounded, because without it the regression this test guards against is a
+	// hang rather than a failure: measured, with the lock_timeout statement
+	// removed the run waits on the reader forever and the package dies on the
+	// ten minute panic, taking every other test in it down without naming one.
+	bounded, cancelRun := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelRun()
 	start := time.Now()
-	_, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	_, err := Retain(bounded, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
 	elapsed := time.Since(start)
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
