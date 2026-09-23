@@ -88,8 +88,14 @@ func run(ctx context.Context, out io.Writer, dsn string, span store.PartitionSpa
 	// against a default nobody chose.
 	dropped, err := store.Retain(ctx, dsn, time.Now(), retain, span)
 	for _, d := range dropped {
-		fmt.Fprintf(out, "dropped %s covering %s to %s, %d rows\n",
-			d.Name, d.RangeStart.Format(time.DateOnly), d.RangeEnd.Format(time.DateOnly), d.Rows)
+		rows := fmt.Sprintf("%d rows", d.Rows)
+		if !d.Counted {
+			// Never "0 rows": nobody counted this one, and printing a zero
+			// would report a measurement that was not taken.
+			rows = "an uncounted number of rows"
+		}
+		fmt.Fprintf(out, "dropped %s covering %s to %s, %s\n",
+			d.Name, d.RangeStart.Format(time.DateOnly), d.RangeEnd.Format(time.DateOnly), rows)
 	}
 	if err != nil {
 		// Whatever was dropped before the failure is still dropped, and the

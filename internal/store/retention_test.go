@@ -756,11 +756,13 @@ func TestARunStoppedAfterTheDetachIsFinishedByTheNextOne(t *testing.T) {
 	}
 }
 
-// The other half of the same state: the drop went through and the process ended
-// before the stamp, so the row claims a partition that is not there. Nothing
-// can be counted at that point, and a count nobody took has to stay null rather
-// than become a zero a later reader would take for a measurement.
-func TestARecordLeftOpenForAPartitionThatIsGoneIsClosed(t *testing.T) {
+// The other half of the same state, and the reachable one: the drop went through
+// and the process ended before the stamp. The count is already in the record by
+// then, because it is written before the drop, so what a killed run leaves is an
+// open row with its number, not an open row with nothing. An earlier version of
+// this test cleared the count as well and so described a state no run produces,
+// which meant the line that handles the real one was never exercised.
+func TestARecordLeftOpenAfterTheDropIsClosedWithItsCount(t *testing.T) {
 	dsn := withHistory(t)
 	c := conn(t, dsn)
 	ctx := context.Background()
@@ -771,8 +773,9 @@ func TestARecordLeftOpenForAPartitionThatIsGoneIsClosed(t *testing.T) {
 	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	// Exactly what a process killed between the drop and the stamp leaves.
-	if _, err := c.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = NULL, rows_dropped = NULL
+	// Exactly what a process killed between the drop and the stamp leaves: the
+	// count and the detach time are in, the stamp is not.
+	if _, err := c.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = NULL
 	                           WHERE partition_name = $1`, name); err != nil {
 		t.Fatal(err)
 	}
@@ -783,6 +786,56 @@ func TestARecordLeftOpenForAPartitionThatIsGoneIsClosed(t *testing.T) {
 	}
 	if len(dropped) != 1 || dropped[0].Name != name {
 		t.Fatalf("the run reported %v, want just %s", dropped, name)
+	}
+	if dropped[0].Rows != 2 || !dropped[0].Counted {
+		t.Fatalf("the run reported %d rows counted=%v, want the 2 the record already held",
+			dropped[0].Rows, dropped[0].Counted)
+	}
+	var rows *int64
+	var stamped *time.Time
+	if err := c.QueryRow(ctx, `SELECT rows_dropped, dropped_at FROM events_partition_drops
+	                            WHERE partition_name = $1`, name).Scan(&rows, &stamped); err != nil {
+		t.Fatal(err)
+	}
+	if stamped == nil {
+		t.Fatalf("%s is gone and its record is still open", name)
+	}
+	if rows == nil || *rows != 2 {
+		t.Fatalf("the record lost its count while being closed, it says %v", rows)
+	}
+}
+
+// And the state no run produces, which is a partition dropped by hand beside an
+// open record. There is nothing left to count, so the record is closed as it
+// stands and the caller is told the number is not a measurement. Zero would be a
+// measurement, and the whole point of the record is to keep "held nothing" and
+// "nobody looked" apart.
+func TestARecordWithNoCountIsClosedWithoutInventingOne(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 3)
+	name := partitionName(weekStart(old))
+
+	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if _, err := c.Exec(ctx, `UPDATE events_partition_drops
+	                           SET dropped_at = NULL, rows_dropped = NULL, detached_at = NULL
+	                           WHERE partition_name = $1`, name); err != nil {
+		t.Fatal(err)
+	}
+
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err != nil {
+		t.Fatalf("the run that should close the record: %v", err)
+	}
+	if len(dropped) != 1 || dropped[0].Name != name {
+		t.Fatalf("the run reported %v, want just %s", dropped, name)
+	}
+	if dropped[0].Counted {
+		t.Fatal("the run reported a counted number for a partition nobody counted")
 	}
 	var rows *int64
 	var stamped *time.Time

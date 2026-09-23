@@ -99,6 +99,14 @@ type Dropped struct {
 	RangeStart time.Time
 	RangeEnd   time.Time
 	Rows       int64
+
+	// Counted is false when nobody ever counted this partition, which happens
+	// only when a record is resumed for a table that is already gone and whose
+	// count was never written. Rows is zero then, and zero is a measurement, so
+	// a caller that prints the number has to print this instead: a partition
+	// nobody counted and one that held nothing look the same otherwise, and the
+	// record exists to keep them apart.
+	Counted bool
 }
 
 // bounds parses what pg_get_expr renders for a range partition. The shape is
@@ -374,7 +382,7 @@ func dropOne(ctx context.Context, conn *pgx.Conn, c candidate, now time.Time) (D
 	if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), id); err != nil {
 		return Dropped{}, fmt.Errorf("retention: stamp %s: %w", c.name, err)
 	}
-	return Dropped{Name: c.name, RangeStart: c.from, RangeEnd: c.to, Rows: rows}, nil
+	return Dropped{Name: c.name, RangeStart: c.from, RangeEnd: c.to, Rows: rows, Counted: true}, nil
 }
 
 // resumeUnfinished finishes what a run that stopped after the detach left
@@ -437,6 +445,7 @@ func resumeUnfinished(ctx context.Context, conn *pgx.Conn, now time.Time) ([]Dro
 	var out []Dropped
 	for _, u := range open {
 		var n int64
+		counted := true
 		switch {
 		case u.onDisk:
 			n = 0
@@ -457,11 +466,18 @@ func resumeUnfinished(ctx context.Context, conn *pgx.Conn, now time.Time) ([]Dro
 			}
 		case u.rows != nil:
 			n = *u.rows
+		default:
+			// The table is gone and no count was ever written, which a run
+			// cannot produce on its own: the count goes in before the drop. It
+			// is what a partition dropped by hand next to an open record looks
+			// like, and the row is closed as it stands rather than gaining a
+			// zero nobody measured.
+			counted = false
 		}
 		if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), u.id); err != nil {
 			return out, fmt.Errorf("retention: stamp the unfinished %s: %w", u.name, err)
 		}
-		out = append(out, Dropped{Name: u.name, RangeStart: u.from, RangeEnd: u.to, Rows: n})
+		out = append(out, Dropped{Name: u.name, RangeStart: u.from, RangeEnd: u.to, Rows: n, Counted: counted})
 	}
 	return out, nil
 }
