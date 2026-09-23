@@ -16,6 +16,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -41,53 +42,65 @@ func main() {
 	}
 	ctx := context.Background()
 
-	if *list {
-		parts, err := store.Partitions(ctx, dsn)
-		if err != nil {
-			fail(err)
-		}
-		for name, bound := range parts {
-			fmt.Printf("%s  %s\n", name, bound)
-		}
-		fmt.Printf("%d partitions\n", len(parts))
-		return
-	}
-
-	if *retain > 0 {
-		// The same span the maintainer would run with, so the floor inside
-		// store.Retain is measured against the horizon this command actually
-		// keeps rather than against a default nobody chose.
-		dropped, err := store.Retain(ctx, dsn, time.Now(), *retain, span)
-		if err != nil {
-			// Whatever was dropped before the failure is still dropped, and the
-			// record says so; printing it is how the operator knows where it
-			// stopped rather than guessing from the error alone.
-			for _, d := range dropped {
-				fmt.Println("dropped " + d.Name)
-			}
-			fail(err)
-		}
-		for _, d := range dropped {
-			fmt.Printf("dropped %s covering %s to %s, %d rows\n",
-				d.Name, d.RangeStart.Format(time.DateOnly), d.RangeEnd.Format(time.DateOnly), d.Rows)
-		}
-		if len(dropped) == 0 {
-			fmt.Println("nothing is wholly past the boundary, nothing dropped")
-		}
-		return
-	}
-
-	created, err := store.EnsurePartitions(ctx, dsn, time.Now(), span)
-	if err != nil {
+	if err := run(ctx, os.Stdout, dsn, span, *list, *retain); err != nil {
 		fail(err)
 	}
+}
+
+// run is main's body with its output and its inputs passed in, so the order
+// these two operations happen in has a test rather than a reading.
+func run(ctx context.Context, out io.Writer, dsn string, span store.PartitionSpan, list bool, retain time.Duration) error {
+	if list {
+		parts, err := store.Partitions(ctx, dsn)
+		if err != nil {
+			return err
+		}
+		for name, bound := range parts {
+			fmt.Fprintf(out, "%s  %s\n", name, bound)
+		}
+		fmt.Fprintf(out, "%d partitions\n", len(parts))
+		return nil
+	}
+
+	// The horizon first, and the drop after it, because the flag used to return
+	// before this. A scheduled job given -retain never extended the horizon, so
+	// the command that exists to keep the table writable only ever destroyed:
+	// once the last week ahead ran out, every insert into events would fail
+	// with 23514 and no partition to take it. refuseDefaultPartition rules out
+	// the catch-all that would otherwise hide it.
+	created, err := store.EnsurePartitions(ctx, dsn, time.Now(), span)
+	if err != nil {
+		return err
+	}
 	if len(created) == 0 {
-		fmt.Println("the horizon is already there, nothing created")
-		return
+		fmt.Fprintln(out, "the horizon is already there, nothing created")
 	}
 	for _, name := range created {
-		fmt.Println("created " + name)
+		fmt.Fprintln(out, "created "+name)
 	}
+
+	if retain <= 0 {
+		return nil
+	}
+
+	// The same span the maintainer runs with, so the floor inside store.Retain
+	// is measured against the horizon this command actually keeps rather than
+	// against a default nobody chose.
+	dropped, err := store.Retain(ctx, dsn, time.Now(), retain, span)
+	for _, d := range dropped {
+		fmt.Fprintf(out, "dropped %s covering %s to %s, %d rows\n",
+			d.Name, d.RangeStart.Format(time.DateOnly), d.RangeEnd.Format(time.DateOnly), d.Rows)
+	}
+	if err != nil {
+		// Whatever was dropped before the failure is still dropped, and the
+		// record says so; printing it first is how the operator knows where it
+		// stopped rather than guessing from the error alone.
+		return err
+	}
+	if len(dropped) == 0 {
+		fmt.Fprintln(out, "nothing is wholly past the boundary, nothing dropped")
+	}
+	return nil
 }
 
 func fail(err error) {
