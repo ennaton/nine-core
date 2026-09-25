@@ -642,3 +642,211 @@ func TestADetachThatCannotGetItsLockStopsAndTheNextRunFinishesIt(t *testing.T) {
 		t.Fatalf("the record for %s is not stamped, and the drop happened", name)
 	}
 }
+
+// A run that gets past the detach and then stops is the state no candidate
+// search can see, because a detached partition is not inherited. The record is
+// the only thing left that knows, so the next run has to read it. The state is
+// produced by stopping a real run rather than by staging it with SQL.
+func TestARunStoppedAfterTheDetachIsFinishedByTheNextOne(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 5)
+	name := partitionName(weekStart(old))
+
+	prev := lockTimeout
+	lockTimeout = 3 * time.Second
+	t.Cleanup(func() { lockTimeout = prev })
+
+	first := conn(t, dsn)
+	if _, err := first.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Exec(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, name)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bounded, so a run that stops waiting instead of stopping fails this test
+	// rather than holding the package until the ten minute panic.
+	held, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() {
+		_, err := Retain(held, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+		stopped <- err
+	}()
+
+	deadline := time.After(20 * time.Second)
+	for {
+		if rowsIn(t, c, `SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhrelid
+		                  WHERE p.relname = $1 AND i.inhdetachpending`, name) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the detach never reached the pending mark")
+		case err := <-stopped:
+			t.Fatalf("the run ended before the detach was pending: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// The block goes on the record table, not on the partition. A second reader
+	// of the partition would hold the detach as well, measured: the detach took
+	// the lock timeout and stayed pending, which is the state the test before
+	// this one already covers. Holding events_partition_drops instead lets the
+	// detach finish and stops the statement after it, which is the state
+	// nothing could see.
+	second := conn(t, dsn)
+	if _, err := second.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Exec(ctx, `LOCK TABLE events_partition_drops IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Exec(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := <-stopped
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("the run ended with %v, want the drop to hit the lock timeout", err)
+	}
+
+	// The catalog half of the state first, because the record table is still
+	// held and reading it here would block this test behind its own holder.
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, name); n != 1 {
+		t.Fatalf("%s is gone, so the run did not stop where this test needs it to", name)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhrelid
+	                       WHERE p.relname = $1`, name); n != 0 {
+		t.Fatalf("%s is still inherited, so the detach did not complete", name)
+	}
+
+	if _, err := second.Exec(ctx, `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := rowsIn(t, c, `SELECT count(*) FROM events_partition_drops
+	                       WHERE partition_name = $1 AND dropped_at IS NULL`, name); n != 1 {
+		t.Fatalf("no open record for %s, and that record is the only thing that knows it exists", name)
+	}
+
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err != nil {
+		t.Fatalf("the run after the one that stopped: %v", err)
+	}
+	var finished *Dropped
+	for i := range dropped {
+		if dropped[i].Name == name {
+			finished = &dropped[i]
+		}
+	}
+	if finished == nil || finished.Rows != 5 {
+		t.Fatalf("the next run reported %v, want %s among them with its 5 rows", dropped, name)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM pg_class WHERE relname = $1`, name); n != 0 {
+		t.Fatalf("%s is still on disk after the run that was meant to finish it", name)
+	}
+	if n := rowsIn(t, c, `SELECT count(*) FROM events_partition_drops
+	                       WHERE partition_name = $1 AND dropped_at IS NOT NULL AND rows_dropped = 5`, name); n != 1 {
+		t.Fatalf("the record for %s was not closed with its count", name)
+	}
+}
+
+// The other half of the same state, and the reachable one: the drop went through
+// and the process ended before the stamp. The count is already in the record by
+// then, because it is written before the drop, so what a killed run leaves is an
+// open row with its number, not an open row with nothing. An earlier version of
+// this test cleared the count as well and so described a state no run produces,
+// which meant the line that handles the real one was never exercised.
+func TestARecordLeftOpenAfterTheDropIsClosedWithItsCount(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 2)
+	name := partitionName(weekStart(old))
+
+	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	// Exactly what a process killed between the drop and the stamp leaves: the
+	// count and the detach time are in, the stamp is not.
+	if _, err := c.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = NULL
+	                           WHERE partition_name = $1`, name); err != nil {
+		t.Fatal(err)
+	}
+
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err != nil {
+		t.Fatalf("the run that should close the record: %v", err)
+	}
+	if len(dropped) != 1 || dropped[0].Name != name {
+		t.Fatalf("the run reported %v, want just %s", dropped, name)
+	}
+	if dropped[0].Rows != 2 || !dropped[0].Counted {
+		t.Fatalf("the run reported %d rows counted=%v, want the 2 the record already held",
+			dropped[0].Rows, dropped[0].Counted)
+	}
+	var rows *int64
+	var stamped *time.Time
+	if err := c.QueryRow(ctx, `SELECT rows_dropped, dropped_at FROM events_partition_drops
+	                            WHERE partition_name = $1`, name).Scan(&rows, &stamped); err != nil {
+		t.Fatal(err)
+	}
+	if stamped == nil {
+		t.Fatalf("%s is gone and its record is still open", name)
+	}
+	if rows == nil || *rows != 2 {
+		t.Fatalf("the record lost its count while being closed, it says %v", rows)
+	}
+}
+
+// And the state no run produces, which is a partition dropped by hand beside an
+// open record. There is nothing left to count, so the record is closed as it
+// stands and the caller is told the number is not a measurement. Zero would be a
+// measurement, and the whole point of the record is to keep "held nothing" and
+// "nobody looked" apart.
+func TestARecordWithNoCountIsClosedWithoutInventingOne(t *testing.T) {
+	dsn := withHistory(t)
+	c := conn(t, dsn)
+	ctx := context.Background()
+	old := olderWeek(6)
+	seed(t, c, old, 3)
+	name := partitionName(weekStart(old))
+
+	if _, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind}); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if _, err := c.Exec(ctx, `UPDATE events_partition_drops
+	                           SET dropped_at = NULL, rows_dropped = NULL, detached_at = NULL
+	                           WHERE partition_name = $1`, name); err != nil {
+		t.Fatal(err)
+	}
+
+	dropped, err := Retain(ctx, dsn, time.Now(), 28*24*time.Hour, PartitionSpan{Behind: horizonBehind})
+	if err != nil {
+		t.Fatalf("the run that should close the record: %v", err)
+	}
+	if len(dropped) != 1 || dropped[0].Name != name {
+		t.Fatalf("the run reported %v, want just %s", dropped, name)
+	}
+	if dropped[0].Counted {
+		t.Fatal("the run reported a counted number for a partition nobody counted")
+	}
+	var rows *int64
+	var stamped *time.Time
+	if err := c.QueryRow(ctx, `SELECT rows_dropped, dropped_at FROM events_partition_drops
+	                            WHERE partition_name = $1`, name).Scan(&rows, &stamped); err != nil {
+		t.Fatal(err)
+	}
+	if stamped == nil {
+		t.Fatalf("%s is gone and its record is still open", name)
+	}
+	if rows != nil {
+		t.Fatalf("the record says %d rows for a partition nobody counted, want null", *rows)
+	}
+}

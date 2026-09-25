@@ -24,6 +24,8 @@ import (
 //     makes DETACH CONCURRENTLY fail outright and every run after it,
 //  2. refuse any partition that is not wholly past the boundary, which is the
 //     board's criterion: an active partition cannot be dropped by accident,
+//  2a. finish what a run that stopped after a detach left behind, because that
+//     state is invisible to the search in step 2,
 //  3. write the record, before anything is touched, which is also where a week
 //     that was dropped once and is back is refused, because the record is the
 //     only thing that remembers the drop: that refusal arrives per candidate,
@@ -40,6 +42,11 @@ import (
 // the rows, the detached table still held six, no row described it, and the
 // next clean run returned nil having seen nothing, because a detached table is
 // not inherited and nothing looks for it.
+//
+// Writing the record was only half of that. Until step 2a existed the row was
+// written and never read, so a run that stopped after the detach left the same
+// invisible partition with a note beside it that nothing acted on. The record
+// is what the criterion asks for, and a record no run reads does not meet it.
 //
 // The lock is step zero for a reason measured on this branch. Step one reads
 // pg_get_expr(relpartbound), which takes a lock on every partition and so waits
@@ -92,6 +99,14 @@ type Dropped struct {
 	RangeStart time.Time
 	RangeEnd   time.Time
 	Rows       int64
+
+	// Counted is false when nobody ever counted this partition, which happens
+	// only when a record is resumed for a table that is already gone and whose
+	// count was never written. Rows is zero then, and zero is a measurement, so
+	// a caller that prints the number has to print this instead: a partition
+	// nobody counted and one that held nothing look the same otherwise, and the
+	// record exists to keep them apart.
+	Counted bool
 }
 
 // bounds parses what pg_get_expr renders for a range partition. The shape is
@@ -198,6 +213,13 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration, 
 		return nil, err
 	}
 
+	// Before any candidate is looked for, because a run that stopped after the
+	// detach left something no candidate search can see.
+	out, err := resumeUnfinished(ctx, conn, now)
+	if err != nil {
+		return out, err
+	}
+
 	boundary := now.UTC().Add(-keep)
 	candidates, err := pastPartitions(ctx, conn, boundary)
 	if err != nil {
@@ -218,7 +240,6 @@ func Retain(ctx context.Context, dsn string, now time.Time, keep time.Duration, 
 		candidates = append([]candidate{candidates[i]}, append(candidates[:i:i], candidates[i+1:]...)...)
 	}
 
-	var out []Dropped
 	for _, c := range candidates {
 		d, err := dropOne(ctx, conn, c, now)
 		if err != nil {
@@ -361,7 +382,104 @@ func dropOne(ctx context.Context, conn *pgx.Conn, c candidate, now time.Time) (D
 	if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), id); err != nil {
 		return Dropped{}, fmt.Errorf("retention: stamp %s: %w", c.name, err)
 	}
-	return Dropped{Name: c.name, RangeStart: c.from, RangeEnd: c.to, Rows: rows}, nil
+	return Dropped{Name: c.name, RangeStart: c.from, RangeEnd: c.to, Rows: rows, Counted: true}, nil
+}
+
+// resumeUnfinished finishes what a run that stopped after the detach left
+// behind, and it runs before anything else looks for a candidate because that
+// state is invisible to every candidate search: a detached partition is not
+// inherited, so pastPartitions and pendingDetach look straight past it, and the
+// only thing that knows it ever existed is the record written before it was
+// touched.
+//
+// Measured on this branch before it existed: a run stopped between the detach
+// and the drop left the partition on disk with its rows, no longer inherited,
+// and the next run returned nil having seen nothing. The record was there the
+// whole time and nothing read it. This is what turns that record from a trace
+// into the thing the criterion says it is.
+//
+// Reaching that state does not need a kill: cmd/partition runs on
+// context.Background() and catches no signal, so Ctrl-C, a scheduler's SIGTERM,
+// the OOM killer or a dropped connection all end the process in the same place,
+// and since this package sets lock_timeout, so does a lock it could not get.
+//
+// Two shapes. The partition is still there, which means the drop never ran or
+// never finished: count it if the count was never taken, then drop and stamp.
+// Or it is gone and only the stamp is missing, which is a run that died between
+// the two, and then the row is closed as it stands: a count nobody took stays
+// null rather than becoming a zero somebody could read as a measurement.
+func resumeUnfinished(ctx context.Context, conn *pgx.Conn, now time.Time) ([]Dropped, error) {
+	type unfinished struct {
+		id       int64
+		name     string
+		from, to time.Time
+		rows     *int64
+		counted  bool
+		onDisk   bool
+	}
+	rows, err := conn.Query(ctx, `
+		SELECT d.id, d.partition_name, d.range_start, d.range_end, d.rows_dropped,
+		       d.detached_at IS NOT NULL, c.oid IS NOT NULL
+		  FROM events_partition_drops d
+		  LEFT JOIN pg_class c
+		         ON c.relname = d.partition_name AND c.relnamespace = 'public'::regnamespace
+		  LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
+		 WHERE d.dropped_at IS NULL AND i.inhrelid IS NULL
+		 ORDER BY d.range_start`)
+	if err != nil {
+		return nil, fmt.Errorf("retention: look for an unfinished drop: %w", err)
+	}
+	var open []unfinished
+	for rows.Next() {
+		var u unfinished
+		if err := rows.Scan(&u.id, &u.name, &u.from, &u.to, &u.rows, &u.counted, &u.onDisk); err != nil {
+			return nil, fmt.Errorf("retention: %w", err)
+		}
+		open = append(open, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("retention: %w", err)
+	}
+	rows.Close()
+
+	var out []Dropped
+	for _, u := range open {
+		var n int64
+		counted := true
+		switch {
+		case u.onDisk:
+			n = 0
+			if u.counted && u.rows != nil {
+				n = *u.rows
+			} else {
+				if err := conn.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, quoteIdent(u.name))).Scan(&n); err != nil {
+					return out, fmt.Errorf("retention: count the unfinished %s: %w", u.name, err)
+				}
+				if _, err := conn.Exec(ctx, `
+					UPDATE events_partition_drops SET rows_dropped = $1, detached_at = $2 WHERE id = $3`,
+					n, now.UTC(), u.id); err != nil {
+					return out, fmt.Errorf("retention: record the count for the unfinished %s: %w", u.name, err)
+				}
+			}
+			if _, err := conn.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, quoteIdent(u.name))); err != nil {
+				return out, fmt.Errorf("retention: drop the unfinished %s: %w", u.name, err)
+			}
+		case u.rows != nil:
+			n = *u.rows
+		default:
+			// The table is gone and no count was ever written, which a run
+			// cannot produce on its own: the count goes in before the drop. It
+			// is what a partition dropped by hand next to an open record looks
+			// like, and the row is closed as it stands rather than gaining a
+			// zero nobody measured.
+			counted = false
+		}
+		if _, err := conn.Exec(ctx, `UPDATE events_partition_drops SET dropped_at = $1 WHERE id = $2`, now.UTC(), u.id); err != nil {
+			return out, fmt.Errorf("retention: stamp the unfinished %s: %w", u.name, err)
+		}
+		out = append(out, Dropped{Name: u.name, RangeStart: u.from, RangeEnd: u.to, Rows: n, Counted: counted})
+	}
+	return out, nil
 }
 
 // quoteIdent is the only safe way to put a name this package read from the
